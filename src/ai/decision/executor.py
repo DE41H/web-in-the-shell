@@ -5,9 +5,9 @@ import json
 import re
 import sys
 from collections import deque
+from typing import TYPE_CHECKING, Any
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
 from network.dispatch.client import DispatchClient
 from serialization.models import CompactStateModel
@@ -37,9 +37,9 @@ class ExecutionResult:
     success: bool
     endpoint: str
     status_code: int
-    response_body: dict | list | None = None
+    response_body: dict[str, Any] | list[Any] | None = None
     error: str | None = None
-    error_info: "ErrorInfo | None" = None
+    error_info: ErrorInfo | None = None
 
 
 class ExecutionAgent:
@@ -59,14 +59,14 @@ class ExecutionAgent:
         self._dispatch = dispatch
         self._recovery = RecoveryAgent(recovery_client)
         self.state_history: deque[CompactStateModel] = deque(maxlen=10)
-        self.last_usage: dict | None = None
-        self.total_usage: dict = {}
+        self.last_usage: dict[str, Any] | None = None
+        self.total_usage: dict[str, Any] = {}
 
     async def execute(
         self,
         action: str,
         endpoint: str,
-        parameters: dict,
+        parameters: dict[str, Any],
         state: CompactStateModel | None = None,
         method: str = "POST",
     ) -> ExecutionResult:
@@ -234,7 +234,7 @@ class ExecutionAgent:
 
         return results
 
-    def _log_step_cost(self, step_num: int, usage: dict) -> None:
+    def _log_step_cost(self, step_num: int, usage: dict[str, Any]) -> None:
         inp = usage.get("input", 0)
         out = usage.get("output", 0)
         model = usage.get("model", "unknown")
@@ -247,9 +247,9 @@ class ExecutionAgent:
         self,
         action: str,
         endpoint: str,
-        parameters: dict,
+        parameters: dict[str, Any],
         context: str,
-    ) -> dict:
+    ) -> dict[str, Any]:
         context = context[:_CONTEXT_BUDGET]
         prompt = (
             f"Action: {action}\n"

@@ -9,7 +9,10 @@ BEARER_RE = re.compile(r"Bearer\s+([A-Za-z0-9._~+/=\-]{8,})", re.IGNORECASE)
 JWT_RE = re.compile(r"\bey[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+")
 
 # key=<value> where value is 16+ alphanumeric chars (API keys, session tokens, etc.)
-KEY_VALUE_RE = re.compile(r"(\b\w+)=([A-Za-z0-9]{16,})")
+# Use (?<!\w) instead of \b so that keys preceded by " or : (JSON context) are
+# also matched — \b requires a word character on the left, which silently skips
+# patterns like `"token=abc123def456ghij"`.
+KEY_VALUE_RE = re.compile(r"(?<!\w)(\w+)=([A-Za-z0-9]{16,})")
 
 # Basic Auth: Basic <base64-encoded credentials>
 BASIC_AUTH_RE = re.compile(r"Basic\s+([A-Za-z0-9+/=]{8,})", re.IGNORECASE)

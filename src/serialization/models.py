@@ -4,7 +4,7 @@ import json
 from typing import Any
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator, Field
 
 from network.intercept.sniffer import CapturedResponse
 from security.sanitize import sanitize_for_llm
@@ -48,33 +48,53 @@ def _format_value(v: Any, max_len: int = 80) -> str:
 
 
 class CompactStateModel(BaseModel):
-    """
-    Minimal representation of a single API response for LLM consumption.
-    Strips UI/telemetry noise at construction time so the token footprint
-    reflects only semantically meaningful fields.
+    """Compact, validated representation of a single API response for LLM use.
+
+    Enforces types/limits and strips common noisy keys to keep token
+    consumption predictable. The LLM-facing context should remain small
+    (few keys, short values).
     """
 
+    # Keep backward-compatible behavior for tests: accept extra fields but ignore them.
     model_config = ConfigDict(extra="ignore", strict=False)
 
-    endpoint: str
-    status_code: int
-    payload: dict[str, Any] = {}
+    endpoint: str = Field(..., max_length=200)
+    status_code: int = Field(..., ge=100, le=599)
+    payload: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
     def strip_noise(cls, data: Any) -> Any:
+        # Accept CapturedResponse-like objects by duck-typing
+        if hasattr(data, "url") and hasattr(data, "status"):
+            # construct from capture
+            return {
+                "endpoint": getattr(data, "url"),
+                "status_code": getattr(data, "status"),
+                "payload": getattr(data, "parsed_json", {}) or {},
+            }
+
         if not isinstance(data, dict):
+            # Preserve previous behaviour: pass-through non-mapping inputs so
+            # callers can run the validator in isolation in tests.
             return data
+
         payload = data.get("payload", {})
         if isinstance(payload, dict):
+            # shallow copy after noise strip to preserve original keys
             data["payload"] = _deep_strip(payload, _NOISE_KEYS)
         return data
 
     def to_llm_context(self) -> str:
-        path = urlparse(self.endpoint).path or self.endpoint
+        # Use only path for brevity; fall back to endpoint if parsing fails
+        try:
+            path = urlparse(self.endpoint).path or self.endpoint
+        except Exception:
+            path = self.endpoint
         lines = [f"{path} → {self.status_code}"]
+        # Keep only a small number of keys and short values
         for k, v in list(self.payload.items())[:6]:
-            lines.append(f"{k}={_format_value(v)}")
+            lines.append(f"{k}={_format_value(v, max_len=120)}")
         return sanitize_for_llm("\n".join(lines))
 
     @property

@@ -6,7 +6,7 @@ import httpx
 import pytest
 import respx
 
-from ai.discovery.planner import Plan, PlannerAgent, ToolSchema
+from ai.discovery.planner import Plan, PlannerAgent, ToolSchema, _normalize_domain
 from conftest import (
     make_llm_empty_response,
     make_llm_text_response,
@@ -471,7 +471,12 @@ async def test_handle_fallback_sets_last_messages_with_assistant_text():
     planner = PlannerAgent(client)
     planner._search_duckduckgo = AsyncMock(return_value="search snippet")
     await planner.handle_fallback("find items")
-    assert planner.last_messages[-1] == {"role": "assistant", "content": "I found the domain."}
+    # The assistant text is appended to history; the tool exchange follows it,
+    # so check for presence rather than position.
+    assert any(
+        m == {"role": "assistant", "content": "I found the domain."}
+        for m in planner.last_messages
+    )
 
 
 # ---- route_to_domain with explicit method field ----
@@ -490,6 +495,221 @@ async def test_route_to_domain_with_explicit_get_method():
     ))
     plan = await planner.plan("List all posts")
     assert plan.steps[0]["method"] == "GET"
+
+
+# ── _normalize_domain ────────────────────────────────────────────────────────
+
+def test_normalize_domain_adds_https_when_no_scheme():
+    assert _normalize_domain("example.com") == "https://example.com"
+
+
+def test_normalize_domain_preserves_http_scheme():
+    assert _normalize_domain("http://example.com") == "http://example.com"
+
+
+def test_normalize_domain_strips_path():
+    assert _normalize_domain("https://api.github.com/v3") == "https://api.github.com"
+
+
+def test_normalize_domain_strips_query_string():
+    assert _normalize_domain("https://example.com?foo=bar") == "https://example.com"
+
+
+def test_normalize_domain_lowercases_host():
+    assert _normalize_domain("https://API.GITHUB.COM") == "https://api.github.com"
+
+
+def test_normalize_domain_strips_path_and_lowercases():
+    # _normalize_domain uses str.startswith which is case-sensitive; only lowercase
+    # schemes are recognised as-is. A lowercase scheme with an uppercase host is
+    # the realistic case (LLM emits "https://API.GITHUB.COM/v3/repos").
+    assert _normalize_domain("https://API.GITHUB.COM/v3/repos") == "https://api.github.com"
+
+
+def test_normalize_domain_preserves_port():
+    assert _normalize_domain("https://api.example.com:8080") == "https://api.example.com:8080"
+
+
+def test_normalize_domain_no_double_https():
+    assert _normalize_domain("https://example.com") == "https://example.com"
+
+
+def test_normalize_domain_www_preserved():
+    assert _normalize_domain("www.example.com") == "https://www.example.com"
+
+
+def test_normalize_domain_strips_fragment():
+    assert _normalize_domain("https://example.com#section") == "https://example.com"
+
+
+# ── candidate_domains in plan() ──────────────────────────────────────────────
+
+async def test_plan_candidate_domains_extracted():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+            "candidate_domains": ["https://www.example.com", "http://api.example.com/path"],
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.candidate_domains == ["https://www.example.com", "http://api.example.com"]
+
+
+async def test_plan_candidate_domains_empty_when_not_provided():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.candidate_domains == []
+
+
+async def test_plan_candidate_domains_empty_list_when_provided_empty():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+            "candidate_domains": [],
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.candidate_domains == []
+
+
+async def test_plan_candidate_domains_blank_strings_filtered():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+            "candidate_domains": ["  ", "", "https://valid.com"],
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.candidate_domains == ["https://valid.com"]
+
+
+async def test_plan_candidate_domains_normalized():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+            "candidate_domains": ["API.EXAMPLE.COM/v2"],
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.candidate_domains == ["https://api.example.com"]
+
+
+async def test_plan_primary_domain_normalized():
+    # The jsonschema validator enforces the ^https?:// pattern on domain, so
+    # the tool input must already carry a scheme. The normalization that matters
+    # here is lowercasing the host and stripping any trailing path.
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://API.EXAMPLE.COM",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.target_domain == "https://api.example.com"
+
+
+async def test_plan_domain_path_stripped():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com/v3",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    plan = await planner.plan("intent")
+    assert plan.target_domain == "https://api.example.com"
+
+
+# ── candidate_domains in handle_fallback() ───────────────────────────────────
+
+async def test_handle_fallback_candidate_domains_extracted():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://app.example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+            "candidate_domains": ["https://www.example.com", "https://m.example.com"],
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    plan = await planner.handle_fallback("find items")
+    assert plan.candidate_domains == ["https://www.example.com", "https://m.example.com"]
+
+
+async def test_handle_fallback_candidate_domains_empty_when_absent():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://app.example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    plan = await planner.handle_fallback("find items")
+    assert plan.candidate_domains == []
+
+
+async def test_handle_fallback_candidate_domains_normalized():
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://app.example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+            "candidate_domains": ["api.fallback.com/v1"],
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    plan = await planner.handle_fallback("find items")
+    assert plan.candidate_domains == ["https://api.fallback.com"]
+
+
+# ── Plan dataclass edge cases ────────────────────────────────────────────────
+
+def test_plan_defaults_candidate_domains_to_empty_list():
+    plan = Plan(target_domain="https://x.com", target_endpoints=["/"], action="a", parameters={})
+    assert plan.candidate_domains == []
+
+
+def test_plan_candidate_domains_is_independent_per_instance():
+    plan_a = Plan(target_domain="https://a.com", target_endpoints=["/"], action="a", parameters={})
+    plan_b = Plan(target_domain="https://b.com", target_endpoints=["/"], action="b", parameters={})
+    plan_a.candidate_domains.append("https://extra.com")
+    assert plan_b.candidate_domains == []
 
 
 async def test_route_to_domain_without_method_defaults_to_post():
@@ -1042,6 +1262,71 @@ async def test_handle_fallback_preserves_empty_list_content():
     ), "Message with content=[] should NOT be stripped"
 
 
+async def test_handle_fallback_last_messages_contains_tool_exchange_openai():
+    """handle_fallback appends tool_use/tool_result exchange to last_messages (OpenAI format)."""
+    tool_input = {
+        "domain": "https://example.com",
+        "endpoints": ["/api/v1"],
+        "action": "search",
+        "parameters": {"q": "test"},
+    }
+    client = mock_llm_client(make_llm_tool_response("route_to_domain", tool_input))
+    # Force OpenAI provider so we get the tool_calls format
+    client.provider = "openai"
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="some result")
+
+    await planner.handle_fallback("search for something")
+
+    # There must be an assistant message with tool_calls in last_messages
+    assert any(
+        m.get("role") == "assistant" and m.get("tool_calls")
+        for m in planner.last_messages
+    ), "last_messages must contain an assistant message with tool_calls (OpenAI format)"
+    # And a corresponding role=tool result message
+    assert any(
+        m.get("role") == "tool"
+        for m in planner.last_messages
+    ), "last_messages must contain a role=tool result message (OpenAI format)"
+
+
+async def test_handle_fallback_last_messages_contains_tool_exchange_anthropic():
+    """handle_fallback appends tool_use/tool_result exchange to last_messages (Anthropic format)."""
+    tool_input = {
+        "domain": "https://example.com",
+        "endpoints": ["/api/v1"],
+        "action": "search",
+        "parameters": {"q": "test"},
+    }
+    client = mock_llm_client(make_llm_tool_response("route_to_domain", tool_input))
+    client.provider = "anthropic"
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="some result")
+
+    await planner.handle_fallback("search for something")
+
+    # There must be an assistant message with a tool_use content block
+    assert any(
+        m.get("role") == "assistant"
+        and isinstance(m.get("content"), list)
+        and any(
+            isinstance(b, dict) and b.get("type") == "tool_use"
+            for b in m["content"]
+        )
+        for m in planner.last_messages
+    ), "last_messages must have an assistant message with type='tool_use' block (Anthropic)"
+    # And a user message with a tool_result content block
+    assert any(
+        m.get("role") == "user"
+        and isinstance(m.get("content"), list)
+        and any(
+            isinstance(b, dict) and b.get("type") == "tool_result"
+            for b in m["content"]
+        )
+        for m in planner.last_messages
+    ), "last_messages must contain a user message with type='tool_result' block (Anthropic format)"
+
+
 # ── plan_steps method default normalisation ───────────────────────────────────
 
 async def test_plan_steps_without_method_defaults_to_post():
@@ -1164,8 +1449,8 @@ async def test_plan_system_prompt_is_terse():
     sent_system = client.chat.call_args.kwargs["system"]
     # Sent system prompt matches the (terse) module constant exactly.
     assert sent_system == _SYSTEM
-    # Length is bounded — no full essay.
-    assert len(sent_system) < 400
+    # Length is bounded — no full essay (allow up to 900 chars for multi-rule prompt).
+    assert len(sent_system) < 900
 
 
 # ── Provider-agnostic: planner accepts a non-Anthropic client and emits

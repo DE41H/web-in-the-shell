@@ -13,7 +13,6 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-
 from security.redact import redact as _redact
 
 if TYPE_CHECKING:
@@ -139,7 +138,13 @@ class AgentDisplay:
         body.append("\n")
 
         for line in self._thoughts[-20:]:
-            body.append(f"  {escape(line)}\n", style="dim white")
+            # Futuristic accent: timestamps dim, content cyan
+            if line.startswith("[") and "]" in line:
+                ts, rest = line.split("]", 1)
+                body.append(f"  {ts}] ", style="dim white")
+                body.append(escape(rest.strip()) + "\n", style="cyan")
+            else:
+                body.append(f"  {escape(line)}\n", style="dim white")
 
         if self._errors:
             last = self._errors[-1]
@@ -159,9 +164,11 @@ class AgentDisplay:
 
         return Panel(
             body,
-            title="[bold cyan] WEB IN THE SHELL [/bold cyan]",
-            border_style="cyan",
-            box=box.DOUBLE_EDGE,
+            title=" WEB IN THE SHELL ",
+            title_align="left",
+            border_style="bright_cyan",
+            box=box.ROUNDED,
+            padding=(1, 2),
         )
 
     @staticmethod
@@ -226,9 +233,11 @@ class AgentDisplay:
 
         return Panel(
             table,
-            title="[bold magenta] NETWORK MONITOR [/bold magenta]",
+            title=" NETWORK MONITOR ",
+            title_align="left",
             border_style="magenta",
-            box=box.DOUBLE_EDGE,
+            box=box.ROUNDED,
+            padding=(1, 2),
             subtitle=footer,
             subtitle_align="left",
         )
@@ -410,41 +419,35 @@ class AgentDisplay:
             prompt: The line to show the operator. Default is
                 ``"Press Enter to close…"``.
         """
-        paused_live = False
-        if not self._plain and self._live is not None:
+        if self._plain:
             try:
-                self._live.stop()
-            except Exception:
+                print(f"\n  {prompt}")
+                await asyncio.to_thread(input)
+            except (EOFError, KeyboardInterrupt):
                 pass
-            paused_live = True
-
-        try:
-            self._console.print(f"\n  [bold cyan]{prompt}[/bold cyan]")
-            await asyncio.to_thread(input)
-        except (EOFError, KeyboardInterrupt):
-            pass
-        finally:
-            if paused_live and self._live is not None:
-                try:
-                    self._live.start()
-                    self._refresh()
-                except Exception:
-                    pass
+        elif self._live is not None:
+            self.set_summary(prompt)
+            try:
+                await asyncio.to_thread(input, "")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            self._live.stop()
 
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
 
-    def __enter__(self) -> "AgentDisplay":
+    def __enter__(self) -> AgentDisplay:
         if _NO_COLOR:
             self._plain = True
             return self
 
+        # Use a slightly slower refresh rate for smoother borders and less CPU
         self._live = Live(
             self._layout,
             console=self._console,
             screen=True,
-            refresh_per_second=8,
+            refresh_per_second=6,
         )
         self._live.__enter__()
         self._refresh()

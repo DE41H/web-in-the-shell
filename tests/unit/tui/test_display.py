@@ -548,15 +548,15 @@ async def test_wait_for_enter_keyboard_interrupt_returns_silently():
 
 @patch("tui.display._NO_COLOR", False)
 @patch("tui.display.Live")
-async def test_wait_for_enter_color_mode_stops_and_restarts_live(mock_live_class):
-    """In color mode, wait_for_enter stops the Live display, blocks, then restarts it."""
+async def test_wait_for_enter_color_mode_stops_live(mock_live_class):
+    """In color mode, wait_for_enter blocks and then stops the live display."""
     d = AgentDisplay()
     with patch("tui.display.asyncio.to_thread", new=AsyncMock(return_value="")):
         with d:
             await d.wait_for_enter()
     live = mock_live_class.return_value
     assert live.stop.called, "Live.stop() should be called in color mode"
-    assert live.start.called, "Live.start() should be called after Enter is pressed"
+    assert not live.start.called, "Live.start() should not be called in the new implementation"
 
 
 @patch("tui.display._NO_COLOR", False)
@@ -571,13 +571,13 @@ async def test_wait_for_enter_eof_in_color_mode_does_not_raise(mock_live_class):
 
 @patch("tui.display._NO_COLOR", False)
 @patch("tui.display.Live")
-async def test_wait_for_enter_uses_custom_prompt(mock_live_class, capsys):
+async def test_wait_for_enter_uses_custom_prompt(mock_live_class):
     """Custom prompt text is shown to the operator."""
     d = AgentDisplay()
     with patch("tui.display.asyncio.to_thread", new=AsyncMock(return_value="")):
         with d:
             await d.wait_for_enter("Hit RETURN when ready")
-    assert "Hit RETURN when ready" in capsys.readouterr().out
+    assert d._summary == "Hit RETURN when ready"
 
 
 # ── set_summary / render polish ───────────────────────────────────────────────
@@ -652,21 +652,23 @@ def test_color_mode_log_error_pins_and_counts(mock_live_class):
             retryable=True,
         )
         d.log_error(err2)
-    
+
     assert len(d._errors) == 2
-    
+
     # Check pinned error in left panel
     panel_left = d._render_left()
     plain_left = panel_left.renderable.plain
     assert "ERROR (2)" in plain_left
     assert "Net failed" in plain_left
     assert "No route" in plain_left
-    
+
     # Check error count in right panel footer
     panel_right = d._render_right()
     plain_right = panel_right.subtitle.plain
     assert "errors:" in plain_right
     assert "1x AUTH" in plain_right
+    assert "1x NETWORK" in plain_right
+
     assert "1x NETWORK" in plain_right
 
 
@@ -686,10 +688,37 @@ def test_color_mode_clear_error(mock_live_class):
         )
         d.log_error(err)
         d.clear_error()
-    
+
     assert len(d._errors) == 0
     panel_left = d._render_left()
     assert "ERROR" not in panel_left.renderable.plain
+
+@patch("tui.display._NO_COLOR", True)
+def test_plain_mode_clear_error():
+    from ai.errors import ErrorInfo, ErrorCategory, ErrorSeverity
+    d = AgentDisplay()
+    err = ErrorInfo(
+        category=ErrorCategory.AUTH,
+        severity=ErrorSeverity.HIGH,
+        title="Auth failed",
+        detail="Bad key",
+        hint="Fix it",
+        retryable=False,
+    )
+    d.log_error(err)
+    d.clear_error()
+    assert len(d._errors) == 0
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+def test_thought_with_rich_markup_brackets_does_not_crash(mock_live_class):
+    d = AgentDisplay()
+    with d:
+        d.log_thought("[2024-01-01T00:00:00] [bold]injected markup[/bold] here")
+        panel = d._render_left()
+    assert panel is not None
+
 
 @patch("tui.display._NO_COLOR", True)
 def test_plain_mode_log_error_prints(capsys):
@@ -709,4 +738,5 @@ def test_plain_mode_log_error_prints(capsys):
     assert "[KEY] Auth failed" in out
     assert "Bad key" in out
     assert "Fix it" in out
+
 

@@ -1,6 +1,7 @@
 import json
 import warnings
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -10,13 +11,39 @@ from persistence.crypto import decrypt, encrypt
 from persistence.models import Convo, ConvoMessage
 
 
-def _redact_list_content(content: list) -> list:
-    """Redact sensitive tokens within a list-typed message content block."""
+def _redact_dict(d: dict[str, Any]) -> dict[str, Any]:
+    """Recursively redact string values inside a dict (e.g. tool_use input)."""
+    out: dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, str):
+            out[k] = redact(v)
+        elif isinstance(v, dict):
+            out[k] = _redact_dict(v)
+        elif isinstance(v, list):
+            out[k] = _redact_list_content(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _redact_list_content(content: list[Any]) -> list[Any]:
+    """Redact sensitive tokens within a list-typed message content block.
+
+    Handles Anthropic content-block shapes:
+    - ``{"type": "text", "text": "..."}`` — redact the ``text`` field.
+    - ``{"type": "tool_use", "input": {...}}`` — recursively redact the
+      ``input`` dict so bearer tokens embedded in request headers survive.
+    - Plain strings — redacted directly.
+    """
     result = []
     for item in content:
         if isinstance(item, dict):
+            # Always redact any top-level "text" field
             if isinstance(item.get("text"), str):
                 item = {**item, "text": redact(item["text"])}
+            # Recursively redact "input" dict (Anthropic tool_use blocks)
+            if isinstance(item.get("input"), dict):
+                item = {**item, "input": _redact_dict(item["input"])}
             result.append(item)
         elif isinstance(item, str):
             result.append(redact(item))
@@ -35,9 +62,32 @@ def _redact_message(message: ConvoMessage) -> ConvoMessage:
     return message
 
 
-def _redact_result(result: dict | None) -> dict | None:
+def _redact_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
     if result is None:
         return None
+    if isinstance(result, dict):
+        sensitive = {
+            "access_token", "refresh_token", "client_secret",
+            "api_secret", "token", "password",
+        }
+
+        def _walk(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                out: dict[str, Any] = {}
+                for k, v in obj.items():
+                    if k.lower() in sensitive:
+                        out[k] = "[REDACTED]"
+                    else:
+                        out[k] = _walk(v)
+                return out
+            if isinstance(obj, list):
+                return [_walk(i) for i in obj]
+            if isinstance(obj, str):
+                return redact(obj)
+            return obj
+
+        return _walk(result)
+
     return json.loads(redact(json.dumps(result)))
 
 
@@ -94,7 +144,15 @@ class ConvoStore:
                 stacklevel=2,
             )
             return None
-        return Convo.from_row(decrypted_row)
+        try:
+            return Convo.from_row(decrypted_row)
+        except Exception as exc:
+            warnings.warn(
+                f"ConvoStore.get_latest_for_intent: failed to parse row for intent "
+                f"'{intent}': {exc}; returning None.",
+                stacklevel=2,
+            )
+            return None
 
     async def save(self, convo: Convo) -> None:
         conn = self._require_conn()
@@ -156,7 +214,15 @@ class ConvoStore:
                     stacklevel=2,
                 )
                 continue
-            out.append(Convo.from_row(decrypted_row))
+            try:
+                out.append(Convo.from_row(decrypted_row))
+            except Exception as exc:
+                warnings.warn(
+                    f"ConvoStore.list_all: failed to parse row id='{row[0]}': {exc}; "
+                    "skipping row.",
+                    stacklevel=2,
+                )
+                continue
         return out
 
     async def clear_all(self) -> int:

@@ -13,6 +13,8 @@ is encrypted ciphertext (not plaintext).
 import asyncio
 import os
 import sqlite3
+
+import pytest
 import sys
 from pathlib import Path
 
@@ -88,6 +90,7 @@ async def _run_subprocess(code: str, env: dict[str, str]) -> tuple[int, str, str
     return proc.returncode, stdout.decode(), stderr.decode()
 
 
+@pytest.mark.integration
 async def test_session_store_round_trip_across_processes(tmp_path: Path, monkeypatch):
     """Write a session in one subprocess, read it in another; verify key stability."""
     db_path = tmp_path / "wits-session.db"
@@ -141,6 +144,7 @@ async def test_session_store_round_trip_across_processes(tmp_path: Path, monkeyp
     assert "'X-Custom': 'value-1'" in lines[3]
 
 
+@pytest.mark.integration
 async def test_session_store_keys_match_keyring_fallback(tmp_path: Path, monkeypatch):
     """Reading the DB with stdlib `sqlite3` (no Python keyring) decrypts correctly.
 
@@ -178,6 +182,7 @@ async def test_session_store_keys_match_keyring_fallback(tmp_path: Path, monkeyp
     assert "'X-Custom': 'value-1'" in extra
 
 
+@pytest.mark.integration
 async def test_session_store_init_db_idempotent_across_processes(tmp_path: Path, monkeypatch):
     """`init_db` is safe to call from multiple processes — schema is IF NOT EXISTS."""
     db_path = tmp_path / "wits-init.db"

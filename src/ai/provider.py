@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+import logging
 from typing import Any
+from pydantic import BaseModel
 
 import httpx
 
@@ -25,6 +26,7 @@ DEFAULT_MODELS: dict[str, str] = {
     "gemini":    "gemini-2.0-flash",
     "together":  "meta-llama/Llama-3-70b-chat-hf",
     "ollama":    "llama3.2",
+    "openrouter": "openai/gpt-4o",
 }
 
 DEFAULT_RECOVERY_MODELS: dict[str, str] = {
@@ -56,22 +58,24 @@ PROVIDER_ENV_VARS: dict[str, str] = {
 _REQUEST_TIMEOUT_S: float = 60.0
 
 
-@dataclass
-class ToolCall:
+class ToolCall(BaseModel):
     name: str
-    input: dict
+    input: dict[str, Any] = {}
     id: str = ""
 
 
-@dataclass
-class LLMResponse:
-    tool_calls: list[ToolCall]
-    text: str
-    usage: dict
+class LLMResponse(BaseModel):
+    tool_calls: list[ToolCall] = []
+    text: str = ""
+    usage: dict[str, Any] = {}
     stop_reason: str = ""
 
 
-def _coerce_tool_args(raw: Any) -> dict:
+class ToolCallFailed(Exception):
+    """Raised when the provider reports a tool/function call failure."""
+
+
+def _coerce_tool_args(raw: Any) -> dict[str, Any]:
     """Best-effort coercion of a tool-call `arguments` field to a dict.
 
     Providers (and our own mocks) sometimes return ``arguments`` as:
@@ -89,12 +93,13 @@ def _coerce_tool_args(raw: Any) -> dict:
         try:
             parsed = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
+            logging.warning("_coerce_tool_args: invalid JSON in tool arguments: %r", raw)
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
 
 
-def _coerce_usage(usage: Any) -> dict:
+def _coerce_usage(usage: Any) -> dict[str, Any]:
     """Normalise Anthropic and OpenAI usage objects to {input, output, model}."""
     if usage is None:
         return {"input": 0, "output": 0, "model": ""}
@@ -145,7 +150,7 @@ class LLMClient:
     async def chat(
         self,
         system: str,
-        messages: list[dict],
+        messages: list[dict[str, Any]],
         tools: list[Any],
         max_tokens: int,
     ) -> LLMResponse:
@@ -158,7 +163,7 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def _chat_anthropic(
-        self, system: str, messages: list[dict], tools: list[Any], max_tokens: int
+        self, system: str, messages: list[dict[str, Any]], tools: list[Any], max_tokens: int
     ) -> LLMResponse:
         rendered = [t.to_anthropic() for t in tools]
         kwargs: dict[str, Any] = dict(
@@ -172,7 +177,7 @@ class LLMClient:
 
         try:
             resp = await asyncio.wait_for(
-                self._backend.messages.create(**kwargs),
+                self._backend.messages.create(**kwargs),  # type: ignore[attr-defined]
                 timeout=_REQUEST_TIMEOUT_S,
             )
         except TimeoutError:
@@ -182,9 +187,19 @@ class LLMClient:
             )
         except Exception as exc:
             import anthropic as _anthropic
+            # Provider connectivity issues
             if isinstance(exc, (_anthropic.APIConnectionError, httpx.ConnectError,
                                 httpx.NetworkError)):
                 raise RuntimeError(f"No connection to {self.provider} API: {exc}") from exc
+            # Detect provider tool/function call failure messages and raise a dedicated exception
+            txt = str(exc).lower()
+            if (
+                "tool_use_failed" in txt
+                or "failed to call a function" in txt
+                or "failed_generation" in txt
+            ):
+                from .provider import ToolCallFailed
+                raise ToolCallFailed(str(exc)) from exc
             raise
 
         calls: list[ToolCall] = []
@@ -210,7 +225,7 @@ class LLMClient:
         )
 
     async def _chat_openai(
-        self, system: str, messages: list[dict], tools: list[Any], max_tokens: int
+        self, system: str, messages: list[dict[str, Any]], tools: list[Any], max_tokens: int
     ) -> LLMResponse:
         oai_messages = [{"role": "system", "content": system}] + list(messages or [])
         rendered = [t.to_openai() for t in tools]
@@ -226,7 +241,7 @@ class LLMClient:
 
         try:
             resp = await asyncio.wait_for(
-                self._backend.chat.completions.create(**kwargs),
+                self._backend.chat.completions.create(**kwargs),  # type: ignore[attr-defined]
                 timeout=_REQUEST_TIMEOUT_S,
             )
         except TimeoutError:
@@ -239,6 +254,14 @@ class LLMClient:
             if isinstance(exc, (_openai.APIConnectionError, httpx.ConnectError,
                                 httpx.NetworkError)):
                 raise RuntimeError(f"No connection to {self.provider} API: {exc}") from exc
+            txt = str(exc).lower()
+            if (
+                "tool_use_failed" in txt
+                or "failed to call a function" in txt
+                or "failed_generation" in txt
+            ):
+                from .provider import ToolCallFailed
+                raise ToolCallFailed(str(exc)) from exc
             raise
 
         if not getattr(resp, "choices", None):

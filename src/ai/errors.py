@@ -30,13 +30,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 import httpx
 
 
-class ErrorCategory(str, Enum):
+class ErrorCategory(StrEnum):
     AUTH = "auth"
     RATE_LIMIT = "rate_limit"
     QUOTA = "quota"
@@ -49,7 +49,7 @@ class ErrorCategory(str, Enum):
     UNKNOWN = "unknown"
 
 
-class ErrorSeverity(str, Enum):
+class ErrorSeverity(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -151,10 +151,17 @@ _PROVIDER_BILLING_HINT: dict[str, str] = {
 
 _AUTH_HINT        = "Run /key to re-enter your API key, or check the provider dashboard."
 _QUOTA_HINT       = "Your API quota is exhausted. Top up or switch provider with /provider."
-_NETWORK_HINT     = "Check your internet connection. The app requires connectivity to the target site."
-_TIMEOUT_HINT     = "Provider is slow or unreachable. Retry, or switch to a faster model with /model."
+_NETWORK_HINT = (
+    "Check your internet connection. The app requires connectivity to the target site."
+)
+_TIMEOUT_HINT = (
+    "Provider is slow or unreachable. Retry, or switch to a faster model with /model."
+)
 _RATE_LIMIT_HINT  = "Wait a moment and retry. Free tiers have per-minute limits."
-_NOT_FOUND_HINT   = "Endpoint returned 404. The AI may have misidentified the route — try /target to override."
+_NOT_FOUND_HINT = (
+    "Endpoint returned 404. The AI may have misidentified the route"
+    " — try /target to override."
+)
 _VALIDATION_HINT  = "The API rejected the request. Inspect the captured response above."
 _SERVER_HINT      = "The target server is having problems. Wait and retry, or switch target."
 _BLOCKED_HINT     = "The request was blocked by the security policy (SSRF guard)."
@@ -204,8 +211,7 @@ def classify(
         A structured :class:`ErrorInfo` safe to hand to the TUI.
     """
     if exc is not None and status_code is None and isinstance(exc, httpx.HTTPStatusError):
-        if exc.response is not None:
-            status_code = exc.response.status_code
+        status_code = exc.response.status_code
 
     name = type(exc).__name__ if exc is not None else ""
     msg  = str(exc) if exc is not None else ""
@@ -219,7 +225,12 @@ def classify(
         )
 
     # ---- HTTP status-driven categories ----
-    if status_code == 401 or "401" in combined or "invalid_api_key" in combined or "authenticationerror" in combined:
+    if (
+        status_code == 401
+        or "401" in combined
+        or "invalid_api_key" in combined
+        or "authenticationerror" in combined
+    ):
         return ErrorInfo(
             category=ErrorCategory.AUTH,
             severity=ErrorSeverity.HIGH,
@@ -231,7 +242,13 @@ def classify(
             source=source,
         )
 
-    if status_code == 429 or "429" in combined or "rate_limit" in combined or "rate limit" in combined or "too many requests" in combined:
+    if (
+        status_code == 429
+        or "429" in combined
+        or "rate_limit" in combined
+        or "rate limit" in combined
+        or "too many requests" in combined
+    ):
         hint = _PROVIDER_BILLING_HINT.get(provider, _RATE_LIMIT_HINT)
         if "quota" in combined and provider in _PROVIDER_BILLING_HINT:
             hint = _PROVIDER_BILLING_HINT[provider]
@@ -334,7 +351,12 @@ def classify(
             source=source,
         )
 
-    if "ssrf" in combined or "allowlist" in combined or "unsafe url" in combined or "blocked navigation" in combined:
+    if (
+        "ssrf" in combined
+        or "allowlist" in combined
+        or "unsafe url" in combined
+        or "blocked navigation" in combined
+    ):
         return ErrorInfo(
             category=ErrorCategory.BLOCKED,
             severity=ErrorSeverity.HIGH,

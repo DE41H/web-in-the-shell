@@ -223,6 +223,91 @@ async def test_login_handshake_launches_visible_browser(
     mock_stealth.apply_stealth_async.assert_any_await(login_page)
 
 
+# ── dialog auto-accept ───────────────────────────────────────────────────────
+
+
+@patch("network.security.stealth._stealth")
+@patch("network.security.stealth.async_playwright")
+async def test_new_page_registers_dialog_handler(mock_async_playwright, mock_stealth):
+    pw_instance, _, _, page = _make_playwright_stack()
+    _patched_async_playwright(mock_async_playwright, pw_instance)
+    mock_stealth.apply_stealth_async = AsyncMock()
+    page.on = MagicMock()
+
+    sb = StealthBrowser()
+    await sb.__aenter__()
+    await sb.new_page()
+
+    event_names = [c.args[0] for c in page.on.call_args_list]
+    assert "dialog" in event_names
+    dialog_call = next(c for c in page.on.call_args_list if c.args[0] == "dialog")
+    assert callable(dialog_call.args[1])
+
+
+@patch("network.security.stealth._stealth")
+@patch("network.security.stealth.async_playwright")
+async def test_dialog_handler_accepts_dialog(mock_async_playwright, mock_stealth):
+    pw_instance, _, _, page = _make_playwright_stack()
+    _patched_async_playwright(mock_async_playwright, pw_instance)
+    mock_stealth.apply_stealth_async = AsyncMock()
+    page.on = MagicMock()
+
+    sb = StealthBrowser()
+    await sb.__aenter__()
+    await sb.new_page()
+
+    dialog_call = next(c for c in page.on.call_args_list if c.args[0] == "dialog")
+    handler = dialog_call.args[1]
+
+    dialog = AsyncMock()
+    dialog.accept = AsyncMock()
+    await handler(dialog)
+
+    dialog.accept.assert_awaited_once()
+
+
+@patch("network.security.stealth._stealth")
+@patch("network.security.stealth.async_playwright")
+async def test_dialog_handler_swallows_accept_exception(mock_async_playwright, mock_stealth):
+    pw_instance, _, _, page = _make_playwright_stack()
+    _patched_async_playwright(mock_async_playwright, pw_instance)
+    mock_stealth.apply_stealth_async = AsyncMock()
+    page.on = MagicMock()
+
+    sb = StealthBrowser()
+    await sb.__aenter__()
+    await sb.new_page()
+
+    dialog_call = next(c for c in page.on.call_args_list if c.args[0] == "dialog")
+    handler = dialog_call.args[1]
+
+    dialog = AsyncMock()
+    dialog.accept = AsyncMock(side_effect=Exception("dialog gone"))
+
+    # Must not raise.
+    await handler(dialog)
+
+
+@patch("network.security.stealth._stealth")
+@patch("network.security.stealth.async_playwright")
+async def test_new_page_dialog_and_stealth_both_registered(mock_async_playwright, mock_stealth):
+    pw_instance, _, _, page = _make_playwright_stack()
+    _patched_async_playwright(mock_async_playwright, pw_instance)
+    mock_stealth.apply_stealth_async = AsyncMock()
+    page.on = MagicMock()
+
+    sb = StealthBrowser()
+    await sb.__aenter__()
+    await sb.new_page()
+
+    mock_stealth.apply_stealth_async.assert_awaited_once_with(page)
+    event_names = [c.args[0] for c in page.on.call_args_list]
+    assert "dialog" in event_names
+
+
+# ── login_handshake ──────────────────────────────────────────────────────────
+
+
 @patch("network.security.stealth._stealth")
 @patch("network.security.stealth.asyncio.get_running_loop")
 @patch("network.security.stealth.async_playwright")

@@ -8,8 +8,6 @@ import urllib.parse
 _BLOCKED_HOSTNAMES: frozenset[str] = frozenset({
     "localhost",
     "metadata.google.internal",
-    "169.254.169.254",   # AWS/GCP/Azure IMDS (hostname form)
-    "fd00:ec2::254",     # AWS IMDSv2 IPv6
 })
 
 _BLOCKED_SCHEMES: frozenset[str] = frozenset({"file", "gopher", "ftp"})

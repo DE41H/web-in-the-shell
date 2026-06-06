@@ -118,7 +118,7 @@ async def test_semaphore_limits_concurrent(sample_session):
         nonlocal counter, max_seen
         counter += 1
         max_seen = max(max_seen, counter)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
         counter -= 1
         return httpx.Response(200)
 
@@ -352,7 +352,7 @@ async def test_patch_acquires_and_releases_semaphore(sample_session):
         nonlocal counter, max_seen
         counter += 1
         max_seen = max(max_seen, counter)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
         counter -= 1
         return httpx.Response(200)
 
@@ -485,3 +485,16 @@ async def test_retry_after_zero_triggers_immediate_retry(sample_session):
     assert route.call_count == 2
     # Must be fast — no 1-second exponential backoff
     assert elapsed < 0.5
+
+
+async def test_ssrf_transport_blocks_private_ip_resolution(sample_session):
+    import socket
+    from unittest.mock import patch
+
+    # getaddrinfo returns: (family, type, proto, canonname, sockaddr)
+    # sockaddr for IPv4 is (ip, port)
+    fake_result = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("169.254.169.254", 80))]
+    with patch("socket.getaddrinfo", return_value=fake_result):
+        async with DispatchClient(sample_session, base_url="http://attacker.com") as dc:
+            with pytest.raises((httpx.ConnectError, ValueError)):
+                await dc.get("http://attacker.com/api")

@@ -1,18 +1,25 @@
 import asyncio
 import json
 import re
-from dataclasses import dataclass, field
 
 from playwright.async_api import Page, Response
+from pydantic import BaseModel, Field
+from typing import Any
 
 
-@dataclass
-class CapturedResponse:
+class CapturedResponse(BaseModel):
     url: str
     status: int
     headers: dict[str, str]
-    body: bytes = field(default_factory=bytes)
-    json: dict | list | None = None
+    body: bytes = Field(default_factory=bytes)
+    # Store the parsed JSON under `parsed_json` but accept the input alias
+    # `json` for compatibility with callers and tests. Provide a `json`
+    # property so existing code can continue to access `capture.json`.
+    parsed_json: Any = Field(default=None, alias="json")
+
+    @property
+    def json(self) -> Any:  # type: ignore[override]
+        return self.parsed_json
 
     @property
     def raw_size(self) -> int:

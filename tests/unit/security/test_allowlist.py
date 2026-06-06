@@ -229,3 +229,8 @@ def test_ipv6_loopback_still_blocked():
 def test_ipv6_link_local_still_blocked():
     with pytest.raises(ValueError):
         validate_url("http://[fe80::1]/")
+
+
+def test_schemeless_url_without_slashes_raises():
+    with pytest.raises(ValueError):
+        validate_url("example.com/path")

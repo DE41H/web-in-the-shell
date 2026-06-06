@@ -1,11 +1,28 @@
 import asyncio
 import urllib.parse
+from typing import Any
 
 import httpx
+from pydantic import BaseModel, Field
 
 from network.dispatch.ratelimit import TokenBucket, parse_retry_after
+from network.dispatch.ssrf_transport import SSRFTransport
 from network.session.manager import SessionManager
 from security.allowlist import validate_url
+from network.dispatch.request_builder import RequestSpec
+
+
+class DispatchConfig(BaseModel):
+    """Pydantic model for DispatchClient configuration.
+
+    This centralises parameter validation and documents the client limits.
+    """
+
+    base_url: str = Field(default="", max_length=200)
+    max_concurrent: int = Field(default=5, ge=1, le=100)
+    requests_per_second: float = Field(default=5.0, ge=0.1)
+    burst: int = Field(default=10, ge=1)
+    max_retries: int = Field(default=2, ge=0, le=10)
 
 
 class DispatchClient:
@@ -32,13 +49,21 @@ class DispatchClient:
         burst: int = 10,
         max_retries: int = 2,
     ) -> None:
+        # Validate and store configuration via a pydantic model
+        cfg = DispatchConfig(
+            base_url=base_url,
+            max_concurrent=max_concurrent,
+            requests_per_second=requests_per_second,
+            burst=burst,
+            max_retries=max_retries,
+        )
         self._session = session
-        self._base_url = base_url
+        self._base_url = cfg.base_url
         self._client: httpx.AsyncClient | None = None
-        self._sem = asyncio.Semaphore(max_concurrent)
-        self._rps = requests_per_second
-        self._burst = burst
-        self._max_retries = max_retries
+        self._sem = asyncio.Semaphore(cfg.max_concurrent)
+        self._rps = cfg.requests_per_second
+        self._burst = cfg.burst
+        self._max_retries = cfg.max_retries
         self._buckets: dict[str, TokenBucket] = {}
         self._bucket_lock = asyncio.Lock()
 
@@ -50,6 +75,7 @@ class DispatchClient:
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            transport=SSRFTransport(),
         )
         return self
 
@@ -85,15 +111,32 @@ class DispatchClient:
                 self._buckets[host] = bucket
             return bucket
 
-    async def _do(self, method: str, url: str, **kwargs) -> httpx.Response:
+    async def _do(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        assert self._client is not None
         host = self._host_for(url)
         bucket = await self._get_bucket(host)
+        # Snapshot caller-supplied headers and content before the retry loop so
+        # that each attempt gets the same values (pop inside the loop would
+        # silently drop them after the first attempt).
+        req_headers = kwargs.pop("headers", None) or {}
+        content = kwargs.pop("content", None)
         attempt = 0
         while True:
             await bucket.acquire()
-            response = await self._client.request(
-                method, url, headers=self._live_headers(), **kwargs
-            )
+            merged_headers = dict(self._live_headers())
+            merged_headers.update(req_headers)
+
+            if content is not None and not isinstance(content, (str, bytes)) and (
+                hasattr(content, "__aiter__") or hasattr(content, "__iter__")
+            ):
+                # httpx accepts an (async) iterator as 'content' for streaming
+                response = await self._client.request(
+                    method, url, headers=merged_headers, content=content, **kwargs
+                )
+            else:
+                response = await self._client.request(
+                    method, url, headers=merged_headers, **kwargs
+                )
             if response.status_code != 429 or attempt >= self._max_retries:
                 return response
             retry_after_hdr = response.headers.get("retry-after")
@@ -107,27 +150,53 @@ class DispatchClient:
             await asyncio.sleep(delay)
             attempt += 1
 
-    async def get(self, endpoint: str, **kwargs) -> httpx.Response:
+    async def get(self, endpoint: str, **kwargs: Any) -> httpx.Response:
         self._guard(endpoint)
         async with self._sem:
             return await self._do("GET", endpoint, **kwargs)
 
-    async def post(self, endpoint: str, payload: dict, **kwargs) -> httpx.Response:
+    async def post(self, endpoint: str, payload: dict[str, Any], **kwargs: Any) -> httpx.Response:
         self._guard(endpoint)
         async with self._sem:
             return await self._do("POST", endpoint, json=payload, **kwargs)
 
-    async def put(self, endpoint: str, payload: dict, **kwargs) -> httpx.Response:
+    async def put(self, endpoint: str, payload: dict[str, Any], **kwargs: Any) -> httpx.Response:
         self._guard(endpoint)
         async with self._sem:
             return await self._do("PUT", endpoint, json=payload, **kwargs)
 
-    async def patch(self, endpoint: str, payload: dict, **kwargs) -> httpx.Response:
+    async def patch(self, endpoint: str, payload: dict[str, Any], **kwargs: Any) -> httpx.Response:
         self._guard(endpoint)
         async with self._sem:
             return await self._do("PATCH", endpoint, json=payload, **kwargs)
 
-    async def delete(self, url: str, **kwargs) -> httpx.Response:
+    async def delete(self, url: str, **kwargs: Any) -> httpx.Response:
         self._guard(url)
         async with self._sem:
             return await self._do("DELETE", url, **kwargs)
+
+    async def send_spec(self, spec: RequestSpec) -> httpx.Response:
+        """Send a RequestSpec using the live session headers/cookies.
+
+        This helper centralises header+cookie merging and allows callers to
+        construct requests declaratively.
+        """
+        if spec.url:
+            self._guard(spec.url)
+        kwargs = spec.to_httpx_kwargs(
+            session_headers=self._live_headers(),
+            session_cookies=self._session.credentials.cookies,
+        )
+        # Resolve relative URLs against base_url if necessary
+        target = spec.url
+        if not target:
+            target = self._base_url
+        elif target.startswith("/") and self._base_url:
+            # join path with base_url
+            from urllib.parse import urljoin
+
+            target = urljoin(self._base_url, target)
+
+        async with self._sem:
+            # Support streaming content by passing through kwargs['content'] as-is
+            return await self._do(spec.method.upper(), target, **kwargs)

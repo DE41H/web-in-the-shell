@@ -1,7 +1,7 @@
 import asyncio
 import sys
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+from playwright.async_api import async_playwright, Browser, BrowserContext, Dialog, Page, Playwright
 from playwright_stealth import Stealth
 
 _stealth = Stealth()
@@ -52,6 +52,17 @@ class StealthBrowser:
             raise RuntimeError("Browser not launched. Use 'async with StealthBrowser()' first.")
         page = await self._context.new_page()
         await _stealth.apply_stealth_async(page)
+
+        # Auto-accept JS dialogs (alert, confirm, prompt, beforeunload).
+        # Headless pipelines cannot interact with native browser dialogs; without
+        # this handler Playwright times out waiting for them to be dismissed.
+        async def _auto_accept(dialog: Dialog) -> None:
+            try:
+                await dialog.accept()
+            except Exception:
+                pass
+
+        page.on("dialog", _auto_accept)
         return page
 
     async def login_handshake(self, url: str) -> Page:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 import httpx
 from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlparse
 
 from security.sanitize import sanitize_for_llm
 from ai.provider import LLMClient
@@ -14,16 +17,16 @@ from persistence import ConvoStore
 class ToolSchema:
     name: str
     description: str
-    parameters: dict  # JSON Schema object
+    parameters: dict[str, Any]
 
-    def to_anthropic(self) -> dict:
+    def to_anthropic(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
             "input_schema": self.parameters,
         }
 
-    def to_openai(self) -> dict:
+    def to_openai(self) -> dict[str, Any]:
         return {
             "type": "function",
             "function": {
@@ -39,11 +42,24 @@ class Plan:
     target_domain: str
     target_endpoints: list[str]
     action: str
-    parameters: dict
-    # Multi-step support: each step is {"action": str, "endpoint": str, "parameters": dict}
-    # The top-level action/target_endpoints[0]/parameters represent the first step for
-    # backward compatibility with main.py.
-    steps: list[dict] = field(default_factory=list)
+    parameters: dict[str, Any]
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    candidate_domains: list[str] = field(default_factory=list)
+
+
+def _normalize_domain(raw: str) -> str:
+    """Canonicalize a domain string returned by the LLM.
+
+    Adds https:// when the scheme is missing, strips any path the LLM
+    accidentally put in the domain field, and lowercases the hostname.
+    """
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = "https://" + raw
+    p = urlparse(raw)
+    scheme = p.scheme.lower() or "https"
+    # Keep only scheme + netloc (drop spurious paths / query strings)
+    netloc = p.netloc.lower() if p.netloc else p.path.lower().split("/")[0]
+    return f"{scheme}://{netloc}"
 
 
 # --- Tool definitions (provider-agnostic) ---
@@ -56,12 +72,25 @@ _TOOL_ROUTE_TO_DOMAIN = ToolSchema(
         "properties": {
             "domain": {
                 "type": "string",
-                "description": "Full base URL of the target application.",
+                "description": (
+                    "Primary base URL of the target application (scheme + host only, "
+                    "no path). Example: https://api.github.com"
+                ),
+                "pattern": "^https?://",
+            },
+            "candidate_domains": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Alternative base URLs to probe if the primary domain is "
+                    "unreachable: www vs non-www variants, regional subdomains, "
+                    "mobile endpoints. Omit when confident."
+                ),
             },
             "endpoints": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "API endpoint paths to intercept.",
+                "items": {"type": "string", "pattern": "^/"},
+                "description": "API endpoint paths to intercept. Each must start with '/'.",
             },
             "action": {
                 "type": "string",
@@ -105,6 +134,7 @@ _TOOL_PLAN_STEPS = ToolSchema(
             "domain": {
                 "type": "string",
                 "description": "Full base URL of the target application.",
+                "pattern": "^https?://",
             },
             "steps": {
                 "type": "array",
@@ -119,6 +149,7 @@ _TOOL_PLAN_STEPS = ToolSchema(
                         "endpoint": {
                             "type": "string",
                             "description": "API endpoint path for this step.",
+                            "pattern": "^/",
                         },
                         "parameters": {
                             "type": "object",
@@ -140,16 +171,47 @@ _TOOL_PLAN_STEPS = ToolSchema(
 
 _PLANNER_TOOLS = [_TOOL_ROUTE_TO_DOMAIN, _TOOL_FALLBACK_SEARCH, _TOOL_PLAN_STEPS]
 
+# Map tool name -> ToolSchema for quick lookup during validation
+_TOOL_BY_NAME: dict[str, ToolSchema] = {t.name: t for t in _PLANNER_TOOLS}
+
+
+def _validate_against_schema(schema: dict, data: Any, path: str = "") -> None:
+    """Validate the given data against the provided JSON Schema using jsonschema.
+
+    This function requires jsonschema to be available as a runtime dependency.
+    Validation errors are re-raised as ValueError so the planner keeps its
+    existing exception contracts for callers and tests.
+    """
+    from jsonschema import validate, ValidationError as _JSVError
+
+    try:
+        validate(instance=data, schema=schema)
+    except _JSVError as e:
+        raise ValueError(str(e)) from e
+
 _SYSTEM = (
-    "Routing agent for a headless protocol AI. Map a user's intent to the "
-    "target domain, endpoints, action, and parameters. Use plan_steps for "
-    "multi-call goals. Output only tool calls — no prose."
+    "Routing agent: map a user's intent to the real production domain, API endpoints, "
+    "action, and parameters.\n"
+    "Rules:\n"
+    "• domain must be scheme + host only — no path (e.g. https://api.github.com, "
+    "https://www.reddit.com). Never example.com, localhost, or search engines.\n"
+    "• Include www. only when the canonical site requires it. Prefer API subdomains "
+    "when the task is programmatic (e.g. api.twitter.com over twitter.com).\n"
+    "• If uncertain between two plausible domains (e.g. www variant vs bare, "
+    "regional subdomain), add 1-2 alternatives in candidate_domains.\n"
+    "• If the target domain is completely unknown, call fallback_search.\n"
+    "• Use plan_steps for goals requiring more than one sequential API call.\n"
+    "• Output only tool calls — no prose."
 )
 
 _FALLBACK_SYSTEM = (
-    "Discovery agent for a headless protocol AI. Given a search query, identify "
-    "the most likely domain and API structure, then call route_to_domain. "
-    "Output only a tool call — no prose."
+    "Discovery agent for a headless AI browser. Given a search query and optional "
+    "search results, identify the single most likely real production domain and its "
+    "API structure, then call route_to_domain.\n"
+    "• domain must be scheme + host only (e.g. https://www.example.com) — no path.\n"
+    "• Include candidate_domains with www/non-www or regional alternatives when "
+    "uncertain.\n"
+    "• Output only a tool call — no prose."
 )
 
 _FALLBACK_TOOLS = [_TOOL_ROUTE_TO_DOMAIN]
@@ -157,6 +219,11 @@ _FALLBACK_TOOLS = [_TOOL_ROUTE_TO_DOMAIN]
 _MAX_HISTORY_MESSAGES = 12
 _PLANNER_MAX_TOKENS = 384
 _FALLBACK_MAX_TOKENS = 384
+
+# Simple in-memory plan cache to reduce repeated LLM calls for identical intents.
+# Keyed by (intent, context_snippet). Size bounded to avoid memory growth.
+# NOTE: plan caching is instance-scoped (PlannerAgent._plan_cache) to avoid
+# cross-test/process interference during unit tests.
 
 
 class PlannerAgent:
@@ -172,13 +239,21 @@ class PlannerAgent:
     def __init__(self, client: LLMClient, convos: ConvoStore | None = None) -> None:
         self._client = client
         self._convos = convos
-        self.last_usage: dict | None = None
-        self.last_messages: list[dict] = []
+        self.last_usage: dict[str, Any] | None = None
+        self.last_messages: list[dict[str, Any]] = []
+        self._plan_cache: dict[tuple[str, str], Plan] = {}
+        self._plan_cache_max = 64
 
     async def plan(self, user_intent: str, context: str = "") -> Plan:
         safe_intent = sanitize_for_llm(user_intent)
         safe_context = sanitize_for_llm(context) if context else ""
-        messages: list[dict] = []
+        messages: list[dict[str, Any]] = []
+
+        # Check cache first (quick path). Cache key includes a short context
+        # snippet so different failure contexts produce new plans.
+        cache_key = (safe_intent, safe_context[:200])
+        if cache_key in self._plan_cache:
+            return self._plan_cache[cache_key]
 
         if self._convos is not None:
             past = await self._convos.get_latest_for_intent(safe_intent)
@@ -193,12 +268,25 @@ class PlannerAgent:
             content += f"\n\nCurrent state context:\n{safe_context}"
         messages.append({"role": "user", "content": content})
 
-        resp = await self._client.chat(
-            system=_SYSTEM,
-            messages=messages,
-            tools=_PLANNER_TOOLS,
-            max_tokens=_PLANNER_MAX_TOKENS,
-        )
+        try:
+            resp = await self._client.chat(
+                system=_SYSTEM,
+                messages=messages,
+                tools=_PLANNER_TOOLS,
+                max_tokens=_PLANNER_MAX_TOKENS,
+            )
+        except Exception as exc:
+            # If the provider reported a tool/function failure, attempt discovery
+            # via fallback_search immediately instead of failing the pipeline.
+            txt = str(exc).lower()
+            if (
+                "failed to call a function" in txt
+                or "tool_use_failed" in txt
+                or "failed_generation" in txt
+            ):
+                # Ask the fallback handler to try discovery using the intent
+                return await self.handle_fallback(safe_intent, messages=messages)
+            raise
         self.last_usage = resp.usage
 
         if resp.text:
@@ -253,10 +341,41 @@ class PlannerAgent:
         self.last_messages = list(messages)
 
         for call in resp.tool_calls:
+            # Validate tool input against its ToolSchema when possible to
+            # catch malformed tool outputs before using them.
+            schema = _TOOL_BY_NAME.get(call.name)
+            if schema is not None:
+                try:
+                    _validate_against_schema(schema.parameters, call.input)
+                except ValueError as e:
+                    # Preserve existing test-friendly error messages for known tools
+                    if call.name == "route_to_domain":
+                        raise ValueError("Malformed route_to_domain") from e
+                    if call.name == "plan_steps":
+                        raise ValueError("Malformed plan_steps") from e
+                    raise ValueError(f"Tool call '{call.name}' failed validation: {e}") from e
+
             if call.name == "route_to_domain":
                 inp = call.input
                 try:
-                    first_endpoint = inp["endpoints"][0] if inp["endpoints"] else ""
+                    # Validate required keys are present; raise ValueError for malformed tool calls
+                    for req in ("domain", "endpoints", "action", "parameters"):
+                        if req not in inp:
+                            raise ValueError(
+                                f"Malformed route_to_domain tool call — missing key {req}"
+                            )
+                    # Normalise domain + endpoints
+                    domain = _normalize_domain(inp["domain"])
+                    candidates = [
+                        _normalize_domain(d)
+                        for d in inp.get("candidate_domains", [])
+                        if isinstance(d, str) and d.strip()
+                    ]
+                    endpoints = [
+                        (e if e.startswith("/") else "/" + e)[:200]
+                        for e in inp.get("endpoints", [])
+                    ]
+                    first_endpoint = endpoints[0] if endpoints else ""
                     steps = [
                         {
                             "action": inp["action"],
@@ -265,13 +384,19 @@ class PlannerAgent:
                             "method": inp.get("method", "POST"),
                         }
                     ]
-                    return Plan(
-                        target_domain=inp["domain"],
-                        target_endpoints=inp["endpoints"],
+                    plan = Plan(
+                        target_domain=domain,
+                        target_endpoints=endpoints,
                         action=inp["action"],
                         parameters=inp["parameters"],
                         steps=steps,
+                        candidate_domains=candidates,
                     )
+                    # Cache plan per-instance
+                    self._plan_cache[cache_key] = plan
+                    if len(self._plan_cache) > self._plan_cache_max:
+                        self._plan_cache.pop(next(iter(self._plan_cache)))
+                    return plan
                 except KeyError as e:
                     raise ValueError(
                         f"Malformed route_to_domain tool call — missing key {e}"
@@ -280,7 +405,7 @@ class PlannerAgent:
             if call.name == "plan_steps":
                 inp = call.input
                 try:
-                    raw_steps: list[dict] = inp.get("steps", [])
+                    raw_steps: list[dict[str, Any]] = inp.get("steps", [])
                     if not raw_steps:
                         raise ValueError("plan_steps tool call returned an empty steps list.")
                     # Normalise each step: apply "POST" default when method is absent
@@ -323,7 +448,9 @@ class PlannerAgent:
                 parts.append(topic["Text"])
         return "\n".join(parts)[:1500]
 
-    async def handle_fallback(self, query: str, *, messages: list[dict] | None = None) -> Plan:
+    async def handle_fallback(
+        self, query: str, *, messages: list[dict[str, Any]] | None = None
+    ) -> Plan:
         """
         Performs a real DuckDuckGo search for the query, then uses an LLM call
         to discover the most likely domain + API endpoint structure and return
@@ -353,12 +480,12 @@ class PlannerAgent:
         )
 
         # H1: keep the full message list for history storage
-        history: list[dict] = list(messages) if messages else []
+        history: list[dict[str, Any]] = list(messages) if messages else []
 
         # Build a clean message list for the LLM call: strip tool-call messages
         # (role=tool, assistant.tool_calls, Anthropic content-list blocks) so the
         # fallback model doesn't see references to tools outside _FALLBACK_TOOLS.
-        def _is_tool_message(m: dict) -> bool:
+        def _is_tool_message(m: dict[str, Any]) -> bool:
             if m.get("role") == "tool":
                 return True
             if m.get("role") == "assistant" and m.get("tool_calls"):
@@ -387,6 +514,48 @@ class PlannerAgent:
         if resp.text:
             history.append({"role": "assistant", "content": resp.text})
 
+        if resp.tool_calls:
+            if self._client.provider == "anthropic":
+                tc_ids = [tc.id or str(uuid.uuid4()) for tc in resp.tool_calls]
+                history.append({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": tc_ids[i], "name": tc.name, "input": tc.input}
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+                history.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tc_ids[i],
+                            "content": json.dumps(tc.input),
+                        }
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+            else:
+                tc_ids = [str(uuid.uuid4()) for _ in resp.tool_calls]
+                history.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tc_ids[i],
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": json.dumps(tc.input)},
+                        }
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+                for i, tc in enumerate(resp.tool_calls):
+                    history.append({
+                        "role": "tool",
+                        "tool_call_id": tc_ids[i],
+                        "content": json.dumps(tc.input),
+                    })
+
         self.last_messages = list(history)
 
         for call in resp.tool_calls:
@@ -395,7 +564,19 @@ class PlannerAgent:
 
             inp = call.input
             try:
-                first_endpoint = inp["endpoints"][0] if inp["endpoints"] else ""
+                if "endpoints" not in inp:
+                    raise KeyError("endpoints")
+                domain = _normalize_domain(inp["domain"])
+                candidates = [
+                    _normalize_domain(d)
+                    for d in inp.get("candidate_domains", [])
+                    if isinstance(d, str) and d.strip()
+                ]
+                endpoints = inp.get("endpoints", [])
+                endpoints = [
+                    (e if e.startswith("/") else "/" + e)[:200] for e in endpoints
+                ]
+                first_endpoint = endpoints[0] if endpoints else ""
                 steps = [
                     {
                         "action": inp["action"],
@@ -405,11 +586,12 @@ class PlannerAgent:
                     }
                 ]
                 return Plan(
-                    target_domain=inp["domain"],
-                    target_endpoints=inp["endpoints"],
+                    target_domain=domain,
+                    target_endpoints=endpoints,
                     action=inp["action"],
                     parameters=inp["parameters"],
                     steps=steps,
+                    candidate_domains=candidates,
                 )
             except KeyError as e:
                 raise ValueError(

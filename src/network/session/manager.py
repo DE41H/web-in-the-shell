@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from playwright.async_api import Page, Request
+from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
     from persistence.session_store import SessionStore
@@ -15,12 +15,11 @@ _CSRF_HEADERS = {"x-csrf-token", "x-xsrf-token", "csrf-token", "x-request-token"
 _MIRROR_HEADERS = {"x-requested-with", "x-api-key", "x-client-id", "x-app-version"}
 
 
-@dataclass
-class SessionCredentials:
-    cookies: dict[str, str] = field(default_factory=dict)
+class SessionCredentials(BaseModel):
+    cookies: dict[str, str] = Field(default_factory=dict)
     bearer_token: str | None = None
     csrf_token: str | None = None
-    extra_headers: dict[str, str] = field(default_factory=dict)
+    extra_headers: dict[str, str] = Field(default_factory=dict)
 
     def as_headers(self) -> dict[str, str]:
         headers = dict(self.extra_headers)
@@ -72,7 +71,9 @@ class SessionManager:
 
     async def sync_cookies(self, page: Page) -> None:
         raw = await page.context.cookies()
-        self.credentials.cookies = {c["name"]: c["value"] for c in raw}
+        self.credentials.cookies = {
+            c["name"]: c["value"] for c in raw if "name" in c and "value" in c
+        }
 
     async def restore(self, host: str, store: SessionStore) -> bool:
         """Prime ``self.credentials`` from *store* for *host*. Returns ``True``

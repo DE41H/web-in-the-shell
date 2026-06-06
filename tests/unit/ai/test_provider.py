@@ -856,6 +856,17 @@ def test_coerce_tool_args_unsupported_type_returns_empty_dict():
     assert _coerce_tool_args(42) == {}
 
 
+def test_coerce_tool_args_logs_warning_on_invalid_json():
+    from unittest.mock import patch
+    from ai.provider import _coerce_tool_args
+    with patch("ai.provider.logging") as mock_logging:
+        result = _coerce_tool_args("not-valid-json{{{{")
+        assert result == {}
+        mock_logging.warning.assert_called_once()
+        call_args = mock_logging.warning.call_args[0]
+        assert "not-valid-json" in str(call_args)
+
+
 def test_coerce_usage_none_returns_zero_zero():
     from ai.provider import _coerce_usage
     assert _coerce_usage(None) == {"input": 0, "output": 0, "model": ""}

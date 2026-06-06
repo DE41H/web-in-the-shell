@@ -223,10 +223,10 @@ def test_clear_key_cache_allows_reload(monkeypatch, tmp_path):
     monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
 
     k1 = _load_or_create_key()
-    assert _crypto_mod._KEY_CACHE is not None
+    assert _crypto_mod._key_cache is not None
 
     clear_key_cache()
-    assert _crypto_mod._KEY_CACHE is None
+    assert _crypto_mod._key_cache is None
 
     k2 = _load_or_create_key()
     # Same key is loaded because it was persisted to the mock keyring.
@@ -239,9 +239,9 @@ def test_key_is_cached_after_first_call(monkeypatch):
     monkeypatch.setattr("persistence.crypto._keyring_get", lambda u: store.get(u))
     monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
 
-    assert _crypto_mod._KEY_CACHE is None
+    assert _crypto_mod._key_cache is None
     _load_or_create_key()
-    assert _crypto_mod._KEY_CACHE is not None
+    assert _crypto_mod._key_cache is not None
 
 
 def test_key_cached_second_call_does_not_invoke_load_uncached(monkeypatch):

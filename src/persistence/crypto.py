@@ -30,15 +30,15 @@ _CIPHERTEXT_PREFIX = "enc:v1:"
 _KEY_B64_PATTERN = re.compile(r"[A-Za-z0-9_\-]{43}=")
 
 # Module-level key cache — loaded once per process lifetime.
-_KEY_CACHE: bytes | None = None
+_key_cache: bytes | None = None
 _CACHE_LOCK = threading.Lock()
 
 
 def clear_key_cache() -> None:
     """Invalidate the in-process key cache (for tests and key rotation)."""
-    global _KEY_CACHE
+    global _key_cache
     with _CACHE_LOCK:
-        _KEY_CACHE = None
+        _key_cache = None
 
 
 def _is_valid_b64_key(s: str | None) -> bool:
@@ -69,9 +69,6 @@ def _load_or_create_file_key() -> bytes:
         content = fallback.read_text(encoding="utf-8").strip()
         if _is_valid_b64_key(content):
             return content.encode("ascii")
-        # File exists but content is not a valid Fernet key — refuse to
-        # overwrite silently, because doing so would permanently destroy all
-        # data encrypted with the old key.
         raise RuntimeError(
             f"Fernet key file '{fallback}' appears corrupt (invalid base64 key). "
             "Either restore the correct key or delete the file manually so a new "
@@ -95,12 +92,12 @@ def _load_or_create_file_key() -> bytes:
 
 
 def _load_or_create_key() -> bytes:
-    global _KEY_CACHE
+    global _key_cache
     with _CACHE_LOCK:
-        if _KEY_CACHE is not None:
-            return _KEY_CACHE
+        if _key_cache is not None:
+            return _key_cache
         key = _load_key_uncached()
-        _KEY_CACHE = key
+        _key_cache = key
         return key
 
 

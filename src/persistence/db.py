@@ -65,4 +65,4 @@ async def journal_mode(path: Path = DEFAULT_DB_PATH) -> str:
     async with aiosqlite.connect(path) as conn:
         cur = await conn.execute("PRAGMA journal_mode")
         row = await cur.fetchone()
-        return row[0]
+        return row[0] if row else ""

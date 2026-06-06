@@ -6,7 +6,6 @@ Covers the full classification matrix, per-provider hints, the
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import MagicMock
 
 import httpx
@@ -46,7 +45,7 @@ def test_classify_plain_connection_error_is_network():
 
 
 def test_classify_asyncio_timeout_error_is_timeout():
-    info = classify(asyncio.TimeoutError())
+    info = classify(TimeoutError())
     assert info.category is ErrorCategory.TIMEOUT
     assert info.retryable is True
 

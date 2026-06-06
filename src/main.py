@@ -17,6 +17,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, UTC
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -27,6 +28,7 @@ from rich.table import Table
 from rich.text import Text
 
 from network.security.stealth import StealthBrowser
+from network.intercept.consent import detect_captcha, dismiss_consent, dismiss_overlays
 from network.intercept.sniffer import PacketSniffer, CapturedResponse
 from network.session.manager import SessionManager
 from network.dispatch.client import DispatchClient
@@ -55,6 +57,132 @@ from persistence import (
 from tui.display import AgentDisplay
 
 _console = Console()
+
+
+async def _probe_url(url: str) -> str | None:
+    """Probe a single URL; return the final URL after redirects, or None if unreachable.
+
+    Tries HEAD first (no body transfer), falls back to GET only on 405. One retry
+    on transient failures. Used in the nav-retry loop where a shared client is not
+    available; for batch probing use _pick_reachable_domain instead.
+    """
+    p = urlparse(url)
+    scheme = p.scheme or "https"
+    host = p.hostname
+    if not host:
+        return None
+    base = f"{scheme}://{host}/"
+    for _ in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as c:
+                r = await c.head(base)
+                if r.status_code == 405:
+                    r = await c.get(base)
+                if r.status_code >= 100:
+                    return str(r.url).rstrip("/") or base.rstrip("/")
+        except Exception:
+            continue
+    return None
+
+
+async def _pick_reachable_domain(urls: list[str]) -> str | None:
+    """Probe candidate domains concurrently; return the final URL of the best reachable one.
+
+    Strategy:
+    - Deduplicates candidates and automatically expands each with its www/non-www
+      counterpart (e.g. github.com → www.github.com and vice-versa).
+    - All probes share one httpx.AsyncClient (single TLS pool, no per-call handshake).
+    - Uses HEAD requests to avoid downloading page bodies.
+    - Uses asyncio.wait(FIRST_COMPLETED): returns as soon as the highest-priority
+      reachable domain is determined, and cancels remaining probes immediately.
+    - Ordering is preserved: the primary URL (index 0) wins over any candidate.
+    """
+    if not urls:
+        return None
+
+    # Build a deduplicated, priority-ordered list expanded with www/non-www variants.
+    seen: set[str] = set()
+    ranked: list[tuple[int, str]] = []
+
+    def _enqueue(priority: int, u: str) -> None:
+        key = u.rstrip("/").lower()
+        if key not in seen:
+            seen.add(key)
+            ranked.append((priority, u))
+
+    for i, u in enumerate(urls):
+        _enqueue(2 * i, u)
+        p = urlparse(u)
+        host = (p.netloc or p.path).lower()
+        alt = (
+            f"{p.scheme}://{host[4:]}"       # strip www.
+            if host.startswith("www.")
+            else f"{p.scheme}://www.{host}"  # add www.
+        )
+        _enqueue(2 * i + 1, alt)
+
+    ranked.sort(key=lambda x: x[0])
+    probe_urls = [u for _, u in ranked]
+    n = len(probe_urls)
+
+    async def _probe_one(u: str, client: httpx.AsyncClient) -> str | None:
+        p2 = urlparse(u)
+        base = f"{p2.scheme or 'https'}://{p2.hostname}/"
+        try:
+            r = await client.head(base)
+            if r.status_code == 405:
+                r = await client.get(base)
+            if r.status_code >= 100:
+                return str(r.url).rstrip("/") or base.rstrip("/")
+        except Exception:
+            pass
+        return None
+
+    timeout = httpx.Timeout(connect=2.0, read=4.0, write=2.0, pool=1.0)
+    limits = httpx.Limits(max_connections=n, max_keepalive_connections=0)
+    async with httpx.AsyncClient(
+        timeout=timeout, follow_redirects=True, limits=limits
+    ) as client:
+        task_to_idx: dict[asyncio.Task, int] = {
+            asyncio.create_task(_probe_one(probe_urls[i], client)): i
+            for i in range(n)
+        }
+        results: dict[int, str] = {}
+        pending = set(task_to_idx)
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    val = t.result()
+                    if val is not None:
+                        results[task_to_idx[t]] = val
+                if results:
+                    best = min(results)
+                    # Return as soon as no pending task can beat our best result.
+                    if not any(task_to_idx[t] < best for t in pending):
+                        return results[best]
+        finally:
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    return results[min(results)] if results else None
+
+
+def _join_url(base: str, endpoint: str | None) -> str:
+    """Join a base URL and an endpoint ensuring a single separating slash.
+
+    Examples:
+      _join_url('https://x.com', '/a') -> 'https://x.com/a'
+      _join_url('https://x.com/', 'a') -> 'https://x.com/a'
+      _join_url('https://x.com', None) -> 'https://x.com'
+    """
+    if not endpoint:
+        return base.rstrip("/")
+    return base.rstrip("/") + "/" + endpoint.lstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -356,10 +484,10 @@ def _is_sensitive(field_type: str, field_name: str) -> bool:
     return field_type in _SENSITIVE_TYPES or bool(_SENSITIVE_NAME_RE.search(field_name))
 
 
-async def _detect_forms(page) -> list[dict]:
+async def _detect_forms(page: Any) -> list[dict[str, Any]]:
     """Extract visible input fields from the current page via JS evaluation."""
     try:
-        raw: list[dict] = await page.evaluate(_FORM_DETECT_JS)
+        raw: list[dict[str, Any]] = await page.evaluate(_FORM_DETECT_JS)
     except Exception:
         return []
     result = []
@@ -375,21 +503,116 @@ async def _detect_forms(page) -> list[dict]:
     return result
 
 
+async def _find_submit(page: Any) -> Any | None:
+    """Return the most prominent visible submit control on the page, or None."""
+    # Prefer explicit type=submit first (most reliable signal)
+    for sel in ('button[type="submit"]', 'input[type="submit"]', '[type="submit"]'):
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                return el
+        except Exception:
+            continue
+    # Fall back to buttons whose text matches common submit labels
+    _SUBMIT_TEXTS = [
+        "Sign in", "Log in", "Login", "Submit", "Continue",
+        "Next", "Send", "Go", "Confirm", "Proceed",
+    ]
+    for text in _SUBMIT_TEXTS:
+        try:
+            # query_selector with :text() is a Playwright extension
+            el = await page.query_selector(f"button:has-text('{text}')")
+            if el and await el.is_visible():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+async def _submit_form(page: Any, display: "AgentDisplay") -> bool:
+    """Click the page's submit button, or press Enter if none is found.
+
+    Returns True if a submission attempt was made.
+    """
+    submit_el = await _find_submit(page)
+    try:
+        if submit_el:
+            display.log_thought("Submitting form…")
+            await submit_el.click()
+            return True
+        # No explicit submit button — press Enter on the active element
+        display.log_thought("No submit button found — pressing Enter…")
+        await page.keyboard.press("Enter")
+        return True
+    except Exception:
+        return False
+
+
 async def _prompt_and_fill_forms(
-    page,
+    page: Any,
     domain: str,
     form_store: FormFieldStore,
     display: "AgentDisplay",
-) -> None:
-    """Detect form fields, prompt user for values (auto-filling saved ones), then fill."""
+    *,
+    no_interactive: bool = False,
+) -> bool:
+    """Detect form fields, fill them, and submit the form.
+
+    Fields that have a saved value in FormFieldStore are filled automatically.
+    Sensitive fields (password, OTP, CVV) are always collected via a masked
+    terminal prompt unless no_interactive=True, in which case they are skipped.
+
+    If every field was satisfied without user input (fully from store), the form
+    is submitted automatically. If user input was needed, the form is still
+    submitted after the prompts complete — the user just had to provide some values.
+
+    Returns True if a form submit was attempted.
+    """
     fields = await _detect_forms(page)
     if not fields:
-        return
+        return False
 
     saved = await form_store.get_all_for_domain(domain)
     to_fill: list[tuple[dict, str]] = []
 
-    # Pause Rich Live so console I/O is readable
+    # ── Determine which fields need prompting ────────────────────────────────
+    sensitive_fields = [f for f in fields if _is_sensitive(f["type"], f["name"])]
+    has_sensitive = bool(sensitive_fields)
+
+    # If all non-sensitive fields are in the store AND there are no sensitive
+    # fields, we can fill and submit entirely without user interaction.
+    if not has_sensitive:
+        store_vals = [(f, saved[f["name"]]) for f in fields if saved.get(f["name"])]
+        if store_vals:
+            display.log_thought(
+                f"Auto-filling {len(store_vals)} field(s) from store (no user input needed)…"
+            )
+            for f, val in store_vals:
+                try:
+                    await page.fill(f["selector"], val)
+                except Exception:
+                    pass
+            return await _submit_form(page, display)
+        # Nothing in store and no sensitive fields — nothing to fill
+        return False
+
+    # ── Interactive path (sensitive fields present or no_interactive skip) ───
+    if no_interactive:
+        # In scripted mode we cannot prompt; fill only from store
+        store_vals = [(f, saved[f["name"]]) for f in fields if saved.get(f["name"])]
+        if store_vals:
+            display.log_thought(
+                f"Non-interactive: auto-filling {len(store_vals)} field(s) from store…"
+            )
+            for f, val in store_vals:
+                try:
+                    await page.fill(f["selector"], val)
+                except Exception:
+                    pass
+            return await _submit_form(page, display)
+        return False
+
+    # Pause Rich Live so the terminal is readable during prompts
     paused = False
     if display._live and not display._plain:
         display._live.stop()
@@ -403,20 +626,24 @@ async def _prompt_and_fill_forms(
             label = f.get("label") or f["name"]
 
             if sensitive:
-                val = getpass.getpass(f"    {label} (sensitive, not stored): ").strip()
+                try:
+                    val = getpass.getpass(f"    {label} (sensitive, not stored): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    val = ""
             elif saved_val:
                 _console.print(
                     f"    [dim]{label}[/dim]: [green]{saved_val[:40]}[/green]"
                     "  [dim](auto-fill — press Enter to keep)[/dim]"
                 )
-                override = _console.input("    ").strip()
+                try:
+                    override = _console.input("    ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    override = ""
                 val = override if override else saved_val
                 if override:
                     await form_store.save(domain, f["name"], f["type"], override)
             else:
-                val = _console.input(f"    {label}: ").strip()
-                if val:
-                    await form_store.save(domain, f["name"], f["type"], val)
+                continue
 
             if val:
                 to_fill.append((f, val))
@@ -426,11 +653,16 @@ async def _prompt_and_fill_forms(
         if paused and display._live:
             display._live.start()
 
+    if not to_fill:
+        return False
+
     for f, val in to_fill:
         try:
             await page.fill(f["selector"], val)
         except Exception:
-            pass  # field may have changed or disappeared after navigation
+            pass
+
+    return await _submit_form(page, display)
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +685,8 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
 
     await init_db(DEFAULT_DB_PATH)
 
-    main_client = recovery_client = None
+    main_client: LLMClient | None = None
+    recovery_client: LLMClient | None = None
     if not config.mock:
         main_model     = config.model or DEFAULT_MODELS.get(config.provider)
         recovery_model = config.recovery_model or DEFAULT_RECOVERY_MODELS.get(config.provider)
@@ -486,7 +719,37 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                 display.log_cost(u["input"], u["output"], u["model"])
             display.log_thought(f"Plan → {plan.target_domain}  steps={len(plan.steps)}")
 
-        target  = config.target or plan.target_domain
+        target = config.target or plan.target_domain
+
+        # Probe primary + candidate domains concurrently to verify reachability
+        # and follow any redirect chain (http→https, bare→www, etc.) before
+        # committing to navigation. Skip when the user supplied --target explicitly.
+        if not config.target and not config.mock:
+            probe_candidates = [plan.target_domain] + [
+                d if d.startswith(("http://", "https://")) else "https://" + d
+                for d in plan.candidate_domains
+            ]
+            display.log_thought(
+                f"Probing {len(probe_candidates)} candidate domain(s)…"
+            )
+            probed = await _pick_reachable_domain(probe_candidates)
+            if probed:
+                # Strip trailing slash and any path from the probed URL so we
+                # keep only scheme+host as the base target.
+                p = urlparse(probed)
+                target = f"{p.scheme}://{p.netloc}"
+                if target != plan.target_domain:
+                    display.log_thought(
+                        f"Domain resolved: {plan.target_domain} → {target}"
+                    )
+                else:
+                    display.log_thought(f"Domain reachable: {target}")
+            else:
+                display.log_thought(
+                    f"All domain probes failed ({', '.join(probe_candidates)}) "
+                    "— proceeding anyway."
+                )
+
         display.log_thought(f"Target: {target}")
 
         # Derive intercept patterns from planned endpoints
@@ -494,7 +757,9 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             patterns = [re.escape(ep.split("?")[0]) for ep in plan.target_endpoints]
         else:
             patterns = [r"/"]
-        nav_url = target.rstrip("/") + (plan.target_endpoints[0] if plan.target_endpoints else "")
+        nav_url = _join_url(target, plan.target_endpoints[0] if plan.target_endpoints else None)
+        if not nav_url.startswith(("http://", "https://")):
+            nav_url = "https://" + nav_url
 
         # ── Step 2: Browser + interception ──────────────────────────────
         display.set_status("Intercepting")
@@ -525,26 +790,119 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         f"↙ {cap.url[-48:]}  {cap.raw_size:,}b→{state.compact_size}b  ({pct}%↓)"
                     )
 
-            host = urlparse(target).hostname or ""
+            host = urlparse(nav_url).hostname or ""
             display.log_thought(f"Navigating → {nav_url}")
-            try:
-                validate_url(nav_url)
-            except ValueError as exc:
-                info = classify(exc=exc, source="browser")
-                display.log_error(info)
-                display.set_status("Failed")
-                return
+
+            # Attempt navigation with simple replan-on-failure loop.
+            # We allow up to (config.replan + 1) navigation attempts when
+            # not in mock mode; mock mode does a single attempt.
             stream_task = asyncio.create_task(_collect_stream())
-            nav_ok = True
+            nav_ok = False
+            nav_attempt = 0
+            max_nav_attempts = (config.replan + 1) if not config.mock else 1
             try:
-                await page.goto(nav_url, wait_until="networkidle", timeout=30_000)
-                await session.sync_cookies(page)
-                await session.restore(host, session_store)
-            except Exception:
-                nav_ok = False
-                display.set_status("Failed")
-                display.log_thought(f"Cannot reach {nav_url}")
-                display.log_thought("Check your internet connection and the target URL.")
+                while nav_attempt < max_nav_attempts:
+                    # Ensure the URL has a scheme and is valid for our validator
+                    if not nav_url.startswith(("http://", "https://")):
+                        nav_url = "https://" + nav_url
+
+                    try:
+                        validate_url(nav_url)
+                    except ValueError as exc:
+                        # Validation failed (bad URL) — surface and try to replan
+                        info = classify(exc=exc, source="browser")
+                        display.log_error(info)
+                        display.set_status("Failed")
+                        if config.mock or nav_attempt + 1 >= max_nav_attempts or not main_client:
+                            break
+                        display.log_thought("URL validation failed — requesting new plan…")
+                        planner = PlannerAgent(main_client, convos=convos)
+                        plan = await planner.plan(
+                            safe_intent, context=f"Navigation to {nav_url} failed: {exc}"
+                        )
+                        last_planner = planner
+                        target = config.target or plan.target_domain
+                        ep0 = plan.target_endpoints[0] if plan.target_endpoints else None
+                        nav_url = _join_url(target, ep0)
+
+                        # Quick reachability probe before attempting browser navigation.
+                        try:
+                            reachable = await _probe_url(nav_url)
+                        except Exception:
+                            reachable = False
+                        if not reachable:
+                            display.log_thought(f"Probe failed for {nav_url} — trying a new plan.")
+                            nav_attempt += 1
+                            continue
+                        nav_attempt += 1
+                        continue
+
+                    try:
+                        # Phase 1: load DOM only — networkidle can block on CAPTCHA / SSE.
+                        await page.goto(nav_url, wait_until="domcontentloaded", timeout=30_000)
+                        await session.sync_cookies(page)
+                        await session.restore(host, session_store)
+
+                        # Phase 2: autonomous banner/overlay/captcha handling.
+                        await dismiss_consent(page)
+                        await dismiss_overlays(page)
+                        captcha_name = await detect_captcha(page)
+                        if captcha_name:
+                            display.log_thought(
+                                f"CAPTCHA detected ({captcha_name}) — "
+                                "rerun with --login for manual handshake."
+                            )
+
+                        # Phase 3: graceful networkidle (best-effort; 8 s cap).
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=8_000)
+                        except Exception:
+                            pass
+
+                        # Phase 4: form detection + fill *before* stream_task cancels
+                        # so that any auth/submit XHR is captured by the sniffer.
+                        if not config.mock:
+                            submitted = await _prompt_and_fill_forms(
+                                page,
+                                target,
+                                form_store,
+                                display,
+                                no_interactive=config.no_interactive,
+                            )
+                            if submitted:
+                                await session.sync_cookies(page)
+                                await dismiss_consent(page)
+                                await dismiss_overlays(page)
+                                try:
+                                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                                except Exception:
+                                    pass
+
+                        nav_ok = True
+                        break
+                    except Exception as exc:
+                        # Navigation failed — classify and optionally replan
+                        info = classify(exc=exc, source="browser")
+                        display.log_error(info)
+                        display.set_status("Failed")
+                        display.log_thought(f"Cannot reach {nav_url}: {exc}")
+                        display.log_thought("Check your internet connection and the target URL.")
+                        if config.mock or nav_attempt + 1 >= max_nav_attempts or not main_client:
+                            break
+                        display.log_thought(
+                            f"Replanning due to navigation failure "
+                            f"(attempt {nav_attempt + 1}/{config.replan})…"
+                        )
+                        planner = PlannerAgent(main_client, convos=convos)
+                        plan = await planner.plan(
+                            safe_intent, context=f"Navigation failed for {nav_url}: {exc}"
+                        )
+                        last_planner = planner
+                        target = config.target or plan.target_domain
+                        ep0 = plan.target_endpoints[0] if plan.target_endpoints else None
+                        nav_url = _join_url(target, ep0)
+                    finally:
+                        nav_attempt += 1
             finally:
                 stream_task.cancel()
                 try:
@@ -554,10 +912,6 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
 
             if not nav_ok:
                 return
-
-            # Form detection + auto-fill (skipped in mock mode)
-            if not config.mock:
-                await _prompt_and_fill_forms(page, target, form_store, display)
 
             for cap in sniffer.drain():
                 state = compact_from_capture(cap)
@@ -569,11 +923,12 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
 
             # ── Step 3: Execution (with optional replan loop) ────────────
             async with DispatchClient(session, base_url=target) as dispatch:
-                executor = (
-                    ExecutionAgent(dispatch, main_client, recovery_client)
-                    if not config.mock
-                    else None
-                )
+                if config.mock:
+                    executor = None
+                else:
+                    assert main_client is not None
+                    assert recovery_client is not None
+                    executor = ExecutionAgent(dispatch, main_client, recovery_client)
                 replan_ctx      = ""
                 overall_success = False
                 results: list[ExecutionResult] = []
@@ -632,6 +987,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                                 )
                                 break
                     else:
+                        assert executor is not None
                         results = await executor.execute_plan(plan, primary_state)
                         if executor.last_usage:
                             u = executor.last_usage
@@ -654,21 +1010,22 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                     overall_success = all(r.success for r in results)
                     if overall_success or config.mock:
                         break
+                    assert executor is not None
                     replan_ctx = _build_replan_context(executor, results)
 
                 # ── Save conversation memory ─────────────────────────────
                 if overall_success:
                     if config.mock:
-                        saved_messages = [
+                        saved_messages: list[ConvoMessage] = [
                             ConvoMessage(
                                 role="user",
                                 content=f"[mock] {plan.action} on "
                                         f"{plan.target_domain}{plan.target_endpoints[0]}",
-                            ).model_dump(),
+                            ),
                             ConvoMessage(
                                 role="assistant",
                                 content=f"[mock] {len(results)} step(s) executed",
-                            ).model_dump(),
+                            ),
                         ]
                     elif last_planner is not None and last_planner.last_messages:
                         saved_messages = [
@@ -683,10 +1040,13 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                             "status_code": results[-1].status_code if results else None,
                             "success":     results[-1].success     if results else False,
                         }
+                        existing = await convos.get_latest_for_intent(safe_intent)
+                        convo_id = existing.id if existing is not None else str(uuid.uuid4())
+                        convo_created_at = existing.created_at if existing is not None else now
                         convo = Convo(
-                            id=str(uuid.uuid4()),
+                            id=convo_id,
                             intent=safe_intent,
-                            created_at=now,
+                            created_at=convo_created_at,
                             updated_at=now,
                             messages=saved_messages,
                             result=result_payload,

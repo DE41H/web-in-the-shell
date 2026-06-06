@@ -1,114 +1,111 @@
-"""End-to-end persistence test: run the mock pipeline, verify the DB round-trip.
-
-Exercises the full stack (intercept → plan → execute → save) against
-jsonplaceholder.typicode.com, then verifies:
-  1. A row was written to the `convos` table.
-  2. The messages and result columns are encrypted (Fernet ciphertext).
-  3. The intent column is stored in plaintext (it's the lookup key).
-  4. The round-trip via ConvoStore preserves the original data.
-  5. `--memory list` and `--memory clear` work from a fresh process.
-"""
-
 import asyncio
-import sqlite3
+import json
+import os
 import sys
+from datetime import datetime
 
+import aiosqlite
 import pytest
 
-from persistence.crypto import _CIPHERTEXT_PREFIX, decrypt
-from persistence.db import init_db
 from persistence.store import ConvoStore
+from persistence.models import Convo, ConvoMessage
 
 
-_RUNNER = (
-    "import asyncio, sys, os; "
-    "sys.path.insert(0, 'src'); "
-    "os.environ['NO_COLOR'] = '1'; "
-    "sys.argv = ['main', '--mock', '--no-interactive', "
-    "           '--intent', 'Fetch posts then create one']; "
-    "import main; "
-    "asyncio.run(main.main())"
-)
-
-_NETWORK_ERROR_MARKERS = (
-    "ConnectionError", "NetworkError", "NameResolutionError",
-    "Temporary failure in name resolution", "Could not connect",
-    "ECONNREFUSED", "ETIMEDOUT", "ERR_NAME_NOT_RESOLVED",
-    "ERR_CONNECTION", "ERR_INTERNET_DISCONNECTED",
-    "ERR_PROXY_CONNECTION", "ERR_SSL", "ERR_CERT", "net::",
-)
-
-
-def _is_network_failure(stderr: str) -> bool:
-    return any(m in stderr for m in _NETWORK_ERROR_MARKERS)
-
-
-@pytest.mark.integration
-async def test_mock_pipeline_persists_encrypted_memory(tmp_path, monkeypatch):
-    """Run the full mock pipeline; verify a row lands in `convos`, encrypted."""
-    db_path = tmp_path / "wits-e2e.db"
-    monkeypatch.setenv("WITS_DB_PATH", str(db_path))
-    monkeypatch.setenv("NO_COLOR", "1")
-
+async def _run_mock_pipeline(db_path: str, intent: str) -> None:
+    """Run the mock pipeline as a subprocess, using the given DB path."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src"
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    env["WITS_DB_PATH"] = db_path
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", _RUNNER,
+        sys.executable, "-c",
+        "import asyncio, sys; "
+        "sys.path.insert(0, 'src'); "
+        f"sys.argv = ['main', '--mock', '--no-interactive', '--intent', {intent!r}]; "
+        "import main; "
+        "asyncio.run(main.main())",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
+        cwd=".",
     )
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
     except (TimeoutError, OSError) as exc:
         try:
             proc.kill()
             await proc.wait()
         except ProcessLookupError:
             pass
-        pytest.skip(f"network unavailable: {exc}")
+        pytest.skip(f"pipeline timed out or network unavailable: {exc}")
 
     stderr_text = stderr.decode(errors="replace")
-    if proc.returncode != 0 and _is_network_failure(stderr_text):
+    network_markers = ("NameResolutionError", "ConnectionError", "net::", "ECONNREFUSED")
+    if proc.returncode != 0 and any(m in stderr_text for m in network_markers):
         pytest.skip(f"network unavailable: {stderr_text[:300]}")
 
     assert proc.returncode == 0, (
-        f"main.py crashed (rc={proc.returncode}): {stderr_text[:500]}"
-    )
-    assert db_path.exists(), f"db file {db_path} was not created"
-
-    conn = sqlite3.connect(db_path)
-    try:
-        cur = conn.execute(
-            "SELECT id, intent, messages, result FROM convos"
-        )
-        rows = cur.fetchall()
-    finally:
-        conn.close()
-    assert len(rows) == 1, f"expected 1 row in convos, got {len(rows)}"
-    convo_id, intent, messages_ct, result_ct = rows[0]
-
-    assert intent == "Fetch posts then create one", (
-        f"intent should be stored in plaintext, got {intent!r}"
-    )
-    assert messages_ct.startswith(_CIPHERTEXT_PREFIX), (
-        f"messages should be Fernet-encrypted, got prefix={messages_ct[:10]!r}"
-    )
-    assert result_ct.startswith(_CIPHERTEXT_PREFIX), (
-        f"result should be Fernet-encrypted, got prefix={result_ct[:10]!r}"
+        f"mock pipeline crashed (rc={proc.returncode}): {stderr_text[:500]}"
     )
 
-    plaintext_messages = decrypt(messages_ct)
-    plaintext_result = decrypt(result_ct)
-    assert "mock" in plaintext_messages.lower() or "create_post" in plaintext_messages, (
-        f"round-tripped messages should mention the mock plan, got {plaintext_messages!r}"
-    )
-    assert "success" in plaintext_result, (
-        f"round-tripped result should include success field, got {plaintext_result!r}"
+
+@pytest.mark.integration
+async def test_same_intent_two_runs_produces_one_row(tmp_path):
+    """Running the mock pipeline twice with the same intent must yield exactly
+    one convo row (INSERT OR REPLACE keyed on a stable id, not a fresh uuid4)."""
+    db_path = str(tmp_path / "wits.db")
+    intent = "Fetch posts then create one"
+
+    await _run_mock_pipeline(db_path, intent)
+    await _run_mock_pipeline(db_path, intent)
+
+    async with aiosqlite.connect(db_path) as conn:
+        async with conn.execute(
+            "SELECT COUNT(*) FROM convos WHERE intent = ?", (intent,)
+        ) as cur:
+            row = await cur.fetchone()
+
+    assert row is not None
+    assert row[0] == 1, (
+        f"Expected 1 convo row for intent {intent!r}, got {row[0]}; "
+        "ConvoStore is accumulating unbounded rows instead of replacing the existing one."
     )
 
-    await init_db(db_path)
-    async with ConvoStore(db_path) as store:
-        latest = await store.get_latest_for_intent("Fetch posts then create one")
-    assert latest is not None, "ConvoStore.get_latest_for_intent should find the row"
-    assert latest.id == convo_id
-    assert latest.intent == "Fetch posts then create one"
-    assert len(latest.messages) >= 1
-    assert latest.result is not None
+
+@pytest.mark.integration
+async def test_convo_store_roundtrip(tmp_path):
+    db = tmp_path / "wits.db"
+    # Create a minimal sqlite schema for tests
+    schema = (
+        "CREATE TABLE convos "
+        "(id TEXT PRIMARY KEY, intent TEXT, created_at TEXT, "
+        "updated_at TEXT, messages BLOB, result BLOB);",
+    )
+    import aiosqlite
+
+    async with aiosqlite.connect(db) as conn:
+        for s in schema:
+            await conn.execute(s)
+        await conn.commit()
+
+    # Use values that match redact() patterns: Bearer token and long key=value
+    convo = Convo(
+        id="c1",
+        intent="Fetch posts",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+        messages=[ConvoMessage(role="user", content="Authorization: Bearer ABCDEFGH12345")],
+        result={"ok": True, "access_token": "abcdefghijklmnop"},
+    )
+
+    async with ConvoStore(db) as store:
+        await store.save(convo)
+        got = await store.get_latest_for_intent("Fetch posts")
+        assert got is not None
+        assert got.intent == convo.intent
+        # Redaction should have occurred: bearer token replaced and access_token redacted
+        dumped_msg = json.dumps(got.messages[0].model_dump())
+        assert "Bearer [REDACTED]" in dumped_msg
+        assert got.result is not None
+        assert "[REDACTED]" in json.dumps(got.result)

@@ -5,6 +5,7 @@ import re
 
 import httpx
 from dataclasses import dataclass
+from typing import Any
 
 from security.sanitize import sanitize_for_llm
 from ai.provider import LLMClient
@@ -13,7 +14,7 @@ from ai.provider import LLMClient
 @dataclass
 class RecoveryResult:
     retry: bool
-    revised_parameters: dict
+    revised_parameters: dict[str, Any]
     abort_reason: str | None = None
 
 
@@ -47,7 +48,7 @@ class RecoveryAgent:
     async def handle(
         self,
         failed_response: httpx.Response,
-        original_parameters: dict,
+        original_parameters: dict[str, Any],
         action: str,
         attempt_number: int = 0,
     ) -> RecoveryResult:
