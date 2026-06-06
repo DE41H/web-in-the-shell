@@ -141,22 +141,22 @@ _TOOL_PLAN_STEPS = ToolSchema(
 _PLANNER_TOOLS = [_TOOL_ROUTE_TO_DOMAIN, _TOOL_FALLBACK_SEARCH, _TOOL_PLAN_STEPS]
 
 _SYSTEM = (
-    "You are a routing agent for a headless protocol AI. "
-    "Given a user's intent, determine: the target web application domain, "
-    "which API endpoints to intercept, and the exact action + parameters to execute. "
-    "Use plan_steps when the goal needs more than one API call. "
-    "Output only tool calls — no prose."
+    "Routing agent for a headless protocol AI. Map a user's intent to the "
+    "target domain, endpoints, action, and parameters. Use plan_steps for "
+    "multi-call goals. Output only tool calls — no prose."
 )
 
 _FALLBACK_SYSTEM = (
-    "You are a discovery agent for a headless protocol AI. "
-    "Given a search query describing an application the user wants to automate, "
-    "identify the most likely domain and API endpoint structure, then call route_to_domain. "
+    "Discovery agent for a headless protocol AI. Given a search query, identify "
+    "the most likely domain and API structure, then call route_to_domain. "
     "Output only a tool call — no prose."
 )
 
-# Tools available during fallback (no plan_steps, no recursive fallback_search)
 _FALLBACK_TOOLS = [_TOOL_ROUTE_TO_DOMAIN]
+
+_MAX_HISTORY_MESSAGES = 12
+_PLANNER_MAX_TOKENS = 384
+_FALLBACK_MAX_TOKENS = 384
 
 
 class PlannerAgent:
@@ -183,8 +183,9 @@ class PlannerAgent:
         if self._convos is not None:
             past = await self._convos.get_latest_for_intent(safe_intent)
             if past is not None:
-                # Cap replayed conversation history to the last 20 messages (10 turns)
-                messages.extend(past.to_llm_messages()[-20:])
+                # Cap replayed history to the last N messages (~6 turns) — keep
+                # token cost bounded as the local store grows.
+                messages.extend(past.to_llm_messages()[-_MAX_HISTORY_MESSAGES:])
 
         # M1: only include context label when context is non-empty
         content = f"Intent: {safe_intent}"
@@ -196,7 +197,7 @@ class PlannerAgent:
             system=_SYSTEM,
             messages=messages,
             tools=_PLANNER_TOOLS,
-            max_tokens=512,
+            max_tokens=_PLANNER_MAX_TOKENS,
         )
         self.last_usage = resp.usage
 
@@ -219,7 +220,11 @@ class PlannerAgent:
                 messages.append({
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": tc_ids[i], "content": json.dumps(tc.input)}
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tc_ids[i],
+                            "content": json.dumps(tc.input),
+                        }
                         for i, tc in enumerate(resp.tool_calls)
                     ],
                 })
@@ -373,7 +378,7 @@ class PlannerAgent:
             system=_FALLBACK_SYSTEM,
             messages=llm_messages,
             tools=_FALLBACK_TOOLS,
-            max_tokens=512,
+            max_tokens=_FALLBACK_MAX_TOKENS,
         )
         self.last_usage = resp.usage
 

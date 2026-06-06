@@ -17,7 +17,7 @@ class RecoveryResult:
     abort_reason: str | None = None
 
 
-_JSON_BLOCK_RE = re.compile(r"```json\s*([\s\S]+?)\s*```")
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]+?)\s*```")
 
 _RECOVERY_SYSTEM = (
     "You are a recovery agent for a headless HTTP automation system. "
@@ -26,6 +26,12 @@ _RECOVERY_SYSTEM = (
     "(b) output ABORT: <reason> if the failure is unrecoverable. "
     "Be terse. No prose outside of those two formats."
 )
+
+_RECOVERY_MAX_TOKENS = 512
+_ERROR_BODY_BUDGET = 600
+
+_ABORT_PREFIXES = ("ABORT:", "ABORT ", "RETRY-ABORT:")
+_BARE_JSON_OBJ_RE = re.compile(r"^\s*\{[\s\S]*\}\s*$")
 
 
 class RecoveryAgent:
@@ -46,46 +52,54 @@ class RecoveryAgent:
         attempt_number: int = 0,
     ) -> RecoveryResult:
         try:
-            error_body = sanitize_for_llm(failed_response.text[:800])
+            error_body = sanitize_for_llm(failed_response.text[:_ERROR_BODY_BUDGET])
         except Exception:
             error_body = "(response body unreadable)"
 
-        safe_params = sanitize_for_llm(json.dumps(original_parameters))
+        safe_params = sanitize_for_llm(json.dumps(original_parameters, separators=(",", ":")))
 
         prompt = (
             f"Attempt: {attempt_number + 1}\n"
-            f"HTTP {failed_response.status_code} on action: '{action}'\n"
-            f"Original parameters: {safe_params}\n"
-            f"Error body:\n{error_body}"
+            f"HTTP {failed_response.status_code} on '{action}'\n"
+            f"Params: {safe_params}\n"
+            f"Error: {error_body}"
         )
 
         resp = await self._client.chat(
             system=_RECOVERY_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
-            max_tokens=512,
+            max_tokens=_RECOVERY_MAX_TOKENS,
         )
-        text = resp.text
+        text = (resp.text or "").strip()
 
-        if text.strip().upper().startswith("ABORT:"):
-            reason = text.split(":", 1)[1].strip() if ":" in text else text[6:].strip()
-            return RecoveryResult(retry=False, revised_parameters={}, abort_reason=reason)
+        # 1) Abort branch (case-insensitive prefix, several variants).
+        upper = text.upper()
+        for prefix in _ABORT_PREFIXES:
+            if upper.startswith(prefix):
+                reason = text[len(prefix):].strip()
+                if not reason:
+                    reason = "Recovery agent aborted without a reason."
+                return RecoveryResult(retry=False, revised_parameters={}, abort_reason=reason)
 
+        # 2) Fenced JSON block.
         match = _JSON_BLOCK_RE.search(text)
         if match:
             try:
                 revised = json.loads(match.group(1))
-                return RecoveryResult(retry=True, revised_parameters=revised)
+                if isinstance(revised, dict):
+                    return RecoveryResult(retry=True, revised_parameters=revised)
             except json.JSONDecodeError:
                 pass
 
-        # Fallback: model may return bare JSON without code fences.
-        try:
-            revised = json.loads(text.strip())
-            if isinstance(revised, dict):
-                return RecoveryResult(retry=True, revised_parameters=revised)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        # 3) Bare JSON object on a single blob.
+        if _BARE_JSON_OBJ_RE.match(text):
+            try:
+                revised = json.loads(text)
+                if isinstance(revised, dict):
+                    return RecoveryResult(retry=True, revised_parameters=revised)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
         return RecoveryResult(
             retry=False,

@@ -513,3 +513,200 @@ async def test_plain_mode_countdown_exit_prints_ticks(mock_sleep, capsys):
     assert "[DONE] exiting in 2s..." in out
     assert "[DONE] exiting in 1s..." in out
     assert d._status == "Complete"
+
+
+# ── wait_for_enter: replaces countdown_exit for interactive REPL ─────────────
+
+@patch("tui.display._NO_COLOR", True)
+async def test_wait_for_enter_plain_mode_prints_prompt(capsys):
+    """In plain mode, wait_for_enter prints the prompt and returns after input()."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(return_value="")):
+        with d:
+            await d.wait_for_enter("Press Enter to close…")
+    out = capsys.readouterr().out
+    assert "Press Enter to close…" in out
+
+
+@patch("tui.display._NO_COLOR", True)
+async def test_wait_for_enter_eof_returns_silently():
+    """EOFError on stdin (piped input) returns silently without raising."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(side_effect=EOFError)):
+        with d:
+            await d.wait_for_enter()
+
+
+@patch("tui.display._NO_COLOR", True)
+async def test_wait_for_enter_keyboard_interrupt_returns_silently():
+    """KeyboardInterrupt (Ctrl-C) returns silently without raising."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(side_effect=KeyboardInterrupt)):
+        with d:
+            await d.wait_for_enter()
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+async def test_wait_for_enter_color_mode_stops_and_restarts_live(mock_live_class):
+    """In color mode, wait_for_enter stops the Live display, blocks, then restarts it."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(return_value="")):
+        with d:
+            await d.wait_for_enter()
+    live = mock_live_class.return_value
+    assert live.stop.called, "Live.stop() should be called in color mode"
+    assert live.start.called, "Live.start() should be called after Enter is pressed"
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+async def test_wait_for_enter_eof_in_color_mode_does_not_raise(mock_live_class):
+    """EOF in color mode returns silently and still attempts to restart the Live display."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(side_effect=EOFError)):
+        with d:
+            await d.wait_for_enter()
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+async def test_wait_for_enter_uses_custom_prompt(mock_live_class, capsys):
+    """Custom prompt text is shown to the operator."""
+    d = AgentDisplay()
+    with patch("tui.display.asyncio.to_thread", new=AsyncMock(return_value="")):
+        with d:
+            await d.wait_for_enter("Hit RETURN when ready")
+    assert "Hit RETURN when ready" in capsys.readouterr().out
+
+
+# ── set_summary / render polish ───────────────────────────────────────────────
+
+@patch("tui.display._NO_COLOR", True)
+def test_set_summary_records_text(capsys):
+    d = AgentDisplay()
+    with d:
+        d.set_summary("All 3 steps succeeded in 4.2s")
+    out = capsys.readouterr().out
+    assert "[SUMMARY] All 3 steps succeeded in 4.2s" in out
+    assert d._summary == "All 3 steps succeeded in 4.2s"
+
+
+@patch("tui.display._NO_COLOR", True)
+def test_set_summary_redacts_secrets(capsys):
+    d = AgentDisplay()
+    with d:
+        d.set_summary("Got Bearer abc123def456ghi789 from /token")
+    assert "[REDACTED]" in d._summary
+    assert "abc123def456ghi789" not in d._summary
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+def test_color_mode_set_summary_updates_panel(mock_live_class):
+    d = AgentDisplay()
+    with d:
+        d.set_summary("Done in 3.1s")
+    assert d._summary == "Done in 3.1s"
+    mock_live_class.return_value.refresh.assert_called()
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+def test_color_mode_render_right_shows_intercept_subtitle(mock_live_class):
+    """The right panel subtitle aggregates raw/compact bytes and reports savings %."""
+    d = AgentDisplay()
+    with d:
+        d.log_intercept("https://api.example.com/a", 200, 1000, 200)
+        d.log_intercept("https://api.example.com/b", 200, 500, 100)
+        panel = d._render_right()
+    assert isinstance(panel.subtitle, Text)
+    plain = panel.subtitle.plain
+    assert "total intercepts: 2" in plain
+    assert "80%" in plain  # (1 - 300/1500) * 100 = 80% saved
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+def test_color_mode_log_error_pins_and_counts(mock_live_class):
+    from ai.errors import ErrorInfo, ErrorCategory, ErrorSeverity
+    d = AgentDisplay()
+    with d:
+        # Error 1
+        err1 = ErrorInfo(
+            category=ErrorCategory.AUTH,
+            severity=ErrorSeverity.HIGH,
+            title="Auth failed",
+            detail="Bad key",
+            hint="Fix it",
+            retryable=False,
+        )
+        d.log_error(err1)
+        # Error 2
+        err2 = ErrorInfo(
+            category=ErrorCategory.NETWORK,
+            severity=ErrorSeverity.HIGH,
+            title="Net failed",
+            detail="No route",
+            hint="Check net",
+            retryable=True,
+        )
+        d.log_error(err2)
+    
+    assert len(d._errors) == 2
+    
+    # Check pinned error in left panel
+    panel_left = d._render_left()
+    plain_left = panel_left.renderable.plain
+    assert "ERROR (2)" in plain_left
+    assert "Net failed" in plain_left
+    assert "No route" in plain_left
+    
+    # Check error count in right panel footer
+    panel_right = d._render_right()
+    plain_right = panel_right.subtitle.plain
+    assert "errors:" in plain_right
+    assert "1x AUTH" in plain_right
+    assert "1x NETWORK" in plain_right
+
+
+@patch("tui.display._NO_COLOR", False)
+@patch("tui.display.Live")
+def test_color_mode_clear_error(mock_live_class):
+    from ai.errors import ErrorInfo, ErrorCategory, ErrorSeverity
+    d = AgentDisplay()
+    with d:
+        err = ErrorInfo(
+            category=ErrorCategory.AUTH,
+            severity=ErrorSeverity.HIGH,
+            title="Auth failed",
+            detail="Bad key",
+            hint="Fix it",
+            retryable=False,
+        )
+        d.log_error(err)
+        d.clear_error()
+    
+    assert len(d._errors) == 0
+    panel_left = d._render_left()
+    assert "ERROR" not in panel_left.renderable.plain
+
+@patch("tui.display._NO_COLOR", True)
+def test_plain_mode_log_error_prints(capsys):
+    from ai.errors import ErrorInfo, ErrorCategory, ErrorSeverity
+    d = AgentDisplay()
+    with d:
+        err = ErrorInfo(
+            category=ErrorCategory.AUTH,
+            severity=ErrorSeverity.HIGH,
+            title="Auth failed",
+            detail="Bad key",
+            hint="Fix it",
+            retryable=False,
+        )
+        d.log_error(err)
+    out = capsys.readouterr().out
+    assert "[KEY] Auth failed" in out
+    assert "Bad key" in out
+    assert "Fix it" in out
+

@@ -490,3 +490,35 @@ class TestTokenEfficiency:
         )
         m = compact_from_capture(cap)
         assert m.compact_size < len(json.dumps(big))
+
+
+# ── Token reduction: at most 6 payload fields in to_llm_context ──────────────
+
+
+def test_to_llm_context_caps_payload_field_count():
+    """to_llm_context emits at most 6 payload fields (down from 8) to keep tokens bounded."""
+    big = {f"k{i}": f"v{i}" for i in range(20)}
+    m = CompactStateModel(endpoint="/p", status_code=200, payload=big)
+    out = m.to_llm_context()
+    field_lines = [line for line in out.splitlines() if "=" in line and not line.startswith("/p")]
+    assert len(field_lines) <= 6
+
+
+def test_to_llm_context_truncates_long_string_values():
+    """Long string values are truncated to keep prompt size bounded."""
+    m = CompactStateModel(
+        endpoint="/p",
+        status_code=200,
+        payload={"title": "x" * 500},
+    )
+    out = m.to_llm_context()
+    assert "x" * 200 not in out
+
+
+def test_to_llm_context_truncates_long_dict_values():
+    """Long dict values are JSON-serialised and truncated to ~80 chars."""
+    big = {"nested": {"k": "v" * 200}}
+    m = CompactStateModel(endpoint="/p", status_code=200, payload={"x": big})
+    out = m.to_llm_context()
+    field_line = next(line for line in out.splitlines() if line.startswith("x="))
+    assert len(field_line) <= 200

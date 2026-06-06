@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import os
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from rich import box
 from rich.console import Console
@@ -8,10 +11,13 @@ from rich.layout import Layout
 from rich.live import Live
 from rich.markup import escape
 from rich.panel import Panel
-
-from security.redact import redact as _redact
 from rich.table import Table
 from rich.text import Text
+
+from security.redact import redact as _redact
+
+if TYPE_CHECKING:
+    from ai.errors import ErrorInfo
 
 
 # ---------------------------------------------------------------------------
@@ -26,31 +32,33 @@ _NO_COLOR: bool = bool(os.environ.get("NO_COLOR") or os.environ.get("TERM") == "
 # ---------------------------------------------------------------------------
 
 _COST_PER_1K: dict[str, tuple[float, float]] = {
-    # Anthropic
     "claude-sonnet-4-6":            (0.003,    0.015),
     "claude-haiku-4-5-20251001":    (0.00025,  0.00125),
     "claude-opus-4-8":              (0.015,    0.075),
-    # OpenAI
     "gpt-4o":                       (0.0025,   0.010),
     "gpt-4o-mini":                  (0.00015,  0.0006),
     "gpt-4-turbo":                  (0.010,    0.030),
-    # Groq (prices negligible but track tokens)
     "llama-3.3-70b-versatile":      (0.00059,  0.00079),
     "llama-3.1-8b-instant":         (0.00005,  0.00008),
     "mixtral-8x7b-32768":           (0.00027,  0.00027),
-    # Gemini
     "gemini-2.0-flash":             (0.0001,   0.0004),
     "gemini-1.5-pro":               (0.00125,  0.005),
     "gemini-1.5-flash":             (0.000075, 0.0003),
-    # Together AI
     "meta-llama/Llama-3-70b-chat-hf": (0.0009, 0.0009),
     "meta-llama/Llama-3-8b-chat-hf":  (0.0002, 0.0002),
 }
 
 
-# ---------------------------------------------------------------------------
-# Status colour map
-# ---------------------------------------------------------------------------
+_STATUS_ICON: dict[str, str] = {
+    "Idle":        "·",
+    "Planning":    "◔",
+    "Executing":   "▶",
+    "Recovering":  "↻",
+    "Complete":    "✓",
+    "Failed":      "✗",
+    "Interrupted": "!",
+}
+
 
 _STATUS_STYLE: dict[str, str] = {
     "Idle":        "dim white",
@@ -71,7 +79,7 @@ class AgentDisplay:
     """
     Two-column Rich TUI.
     Left  — agent thought stream + status badge + optional step progress +
-            pinned cost line.
+            pinned cost line + summary footer.
     Right — live network monitor (raw vs compacted bytes per intercepted
             endpoint).
 
@@ -84,55 +92,70 @@ class AgentDisplay:
         self._thoughts: list[str] = []
         self._status: str = "Idle"
         self._intercepts: list[dict] = []
-
-        # Step progress  (step_num, total, label)  or None
         self._step: tuple[int, int, str] | None = None
-
-        # Token / cost tracking
         self._total_tokens_in: int = 0
         self._total_tokens_out: int = 0
         self._cost_line: str = ""
-
-        # Rich layout
+        self._started_at: datetime = datetime.now()
+        self._summary: str = ""
+        self._errors: list[ErrorInfo] = []
         self._layout = Layout()
         self._layout.split_row(
             Layout(name="left",  ratio=1),
             Layout(name="right", ratio=1),
         )
         self._live: Live | None = None
-
-        # Plain-text mode flag (set in __enter__ if _NO_COLOR)
         self._plain: bool = False
 
     # ------------------------------------------------------------------
     # Rendering helpers
     # ------------------------------------------------------------------
 
+    def _format_elapsed(self) -> str:
+        delta = datetime.now() - self._started_at
+        seconds = int(delta.total_seconds())
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        return f"{minutes}m{secs:02d}s"
+
     def _render_left(self) -> Panel:
         style = _STATUS_STYLE.get(self._status, "white")
+        icon  = _STATUS_ICON.get(self._status, " ")
         body = Text()
 
-        # Status badge
-        body.append(f"  [{self._status}]\n", style=style)
+        body.append(f"  {icon} ", style=style)
+        body.append(f"{self._status}", style=style)
+        body.append(f"  · {self._format_elapsed()}\n", style="dim white")
 
-        # Step progress (just below the status badge)
         if self._step is not None:
             step_num, total, label = self._step
+            bar = self._render_progress_bar(step_num, total)
             body.append(
-                f"  step {step_num}/{total}: {label}\n",
+                f"  step {step_num}/{total}  {bar}  {label}\n",
                 style=style,
             )
 
         body.append("\n")
 
-        # Thought stream (most recent 20 lines)
         for line in self._thoughts[-20:]:
             body.append(f"  {escape(line)}\n", style="dim white")
 
-        # Pinned cost line (separator + cost)
+        if self._errors:
+            last = self._errors[-1]
+            body.append("\n  " + "─" * 36 + "\n", style="dim white")
+            err_label = "ERROR" if len(self._errors) == 1 else f"ERROR ({len(self._errors)})"
+            body.append(f"  {err_label}\n", style="bold red")
+            for line in last.to_lines():
+                body.append(f"  {escape(line)}\n", style="red")
+
         if self._cost_line:
             body.append("\n  " + "─" * 36 + "\n", style="dim white")
             body.append(f"  {self._cost_line}\n", style="bold green")
+
+        if self._summary:
+            body.append("\n  " + "─" * 36 + "\n", style="dim white")
+            body.append(f"  {escape(self._summary)}\n", style=style)
 
         return Panel(
             body,
@@ -140,6 +163,13 @@ class AgentDisplay:
             border_style="cyan",
             box=box.DOUBLE_EDGE,
         )
+
+    @staticmethod
+    def _render_progress_bar(step: int, total: int, width: int = 12) -> str:
+        if total <= 0:
+            return " " * width
+        filled = max(0, min(width, int(round(width * step / total))))
+        return "█" * filled + "░" * (width - filled)
 
     def _render_right(self) -> Panel:
         table = Table(
@@ -171,16 +201,41 @@ class AgentDisplay:
                 Text(ratio, style="green"),
             )
 
+        footer = Text()
+        footer.append("\n  total intercepts: ", style="dim white")
+        footer.append(f"{len(self._intercepts)}", style="bold magenta")
+        if self._intercepts:
+            total_raw = sum(c["raw_bytes"] for c in self._intercepts)
+            total_compact = sum(c["compact_bytes"] for c in self._intercepts)
+            if total_raw:
+                saved_pct = int((1 - total_compact / total_raw) * 100)
+                footer.append(
+                    f"   ↓ saved {saved_pct}% "
+                    f"({total_raw:,}b → {total_compact:,}b)",
+                    style="green",
+                )
+
+        if self._errors:
+            from ai.errors import ErrorCategory
+            footer.append("\n  errors: ", style="dim white")
+            counts: dict[ErrorCategory, int] = {}
+            for e in self._errors:
+                counts[e.category] = counts.get(e.category, 0) + 1
+            for cat, count in counts.items():
+                footer.append(f" {count}x {cat.value.upper()}", style="red")
+
         return Panel(
             table,
             title="[bold magenta] NETWORK MONITOR [/bold magenta]",
             border_style="magenta",
             box=box.DOUBLE_EDGE,
+            subtitle=footer,
+            subtitle_align="left",
         )
 
     def _refresh(self) -> None:
         if self._plain:
-            return  # plain mode: output is immediate via print(); no refresh needed
+            return
         self._layout["left"].update(self._render_left())
         self._layout["right"].update(self._render_right())
         if self._live:
@@ -214,7 +269,7 @@ class AgentDisplay:
         raw_bytes: int,
         compact_bytes: int,
     ) -> None:
-        url = _redact(url)  # strip tokens / long cookie values from URL
+        url = _redact(url)
         self._intercepts.append(
             {
                 "url": url,
@@ -241,16 +296,6 @@ class AgentDisplay:
     # ------------------------------------------------------------------
 
     def log_cost(self, tokens_in: int, tokens_out: int, model: str) -> None:
-        """Update running token totals and recompute the pinned cost line.
-
-        Approximate cost is derived from *_COST_PER_1K*; unknown models are
-        treated as zero cost (line still shows token counts).
-
-        Args:
-            tokens_in:  Number of input (prompt) tokens consumed in this call.
-            tokens_out: Number of output (completion) tokens produced.
-            model:      Model identifier string, e.g. ``"claude-sonnet-4-6"``.
-        """
         self._total_tokens_in  += tokens_in
         self._total_tokens_out += tokens_out
 
@@ -271,17 +316,48 @@ class AgentDisplay:
         self._refresh()
 
     def log_step(self, step_num: int, total: int, label: str) -> None:
-        """Update the step-progress indicator shown below the status badge.
-
-        Args:
-            step_num: Current step number (1-based).
-            total:    Total number of steps in this run.
-            label:    Short human-readable name for the current step,
-                      e.g. ``"create_post"``.
-        """
         self._step = (step_num, total, label)
         if self._plain:
             print(f"[STEP] {step_num}/{total}: {label}")
+            return
+        self._refresh()
+
+    def set_summary(self, text: str) -> None:
+        self._summary = _redact(text)
+        if self._plain:
+            print(f"[SUMMARY] {self._summary}")
+            return
+        self._refresh()
+
+    def log_error(self, error: ErrorInfo) -> None:
+        """Record a structured error from :mod:`ai.errors` for the operator.
+
+        Behaviour:
+
+        - The full error block (icon + title + detail + hint) is appended to
+          the thought stream so it survives the 20-line window when more
+          recent activity pushes it down.
+        - The most recent error is also pinned under an ``ERROR`` banner at
+          the bottom of the left panel, with a counter for repeat failures.
+        - The status badge stays as the caller set it — this method is purely
+          informational. The caller is expected to update status separately.
+
+        Args:
+            error: A structured :class:`ai.errors.ErrorInfo`.
+        """
+        self._errors.append(error)
+        redacted = _redact("\n".join(error.to_lines()))
+        self._thoughts.append(redacted)
+        if self._plain:
+            for line in error.to_lines():
+                print(line)
+            return
+        self._refresh()
+
+    def clear_error(self) -> None:
+        """Clear the pinned error line and counter (thought stream keeps history)."""
+        self._errors.clear()
+        if self._plain:
             return
         self._refresh()
 
@@ -295,6 +371,9 @@ class AgentDisplay:
         Catches ``KeyboardInterrupt`` and ``asyncio.CancelledError`` — both are
         suppressed and the method returns immediately without setting the final
         ``"Complete"`` status.
+
+        Used by ``--no-interactive`` CI runs only; interactive REPL sessions use
+        :meth:`wait_for_enter` instead.
 
         Args:
             seconds: Number of seconds to count down before finishing.
@@ -313,6 +392,45 @@ class AgentDisplay:
         if not self._plain:
             self._refresh()
 
+    async def wait_for_enter(self, prompt: str = "Press Enter to close…") -> None:
+        """Suspend the live display and block until the user presses Enter.
+
+        Used by interactive REPL sessions so the operator can read the
+        execution results before the alternate-screen teardown. Behaviour:
+
+        - **Color mode:** the Rich ``Live`` alternate screen is stopped, the
+          prompt is printed on the regular terminal, then ``input()`` blocks
+          for a line. The ``Live`` is restarted and the display refreshed.
+        - **Plain mode:** the prompt is printed to stdout and ``input()``
+          blocks. No alternate screen is in use.
+        - **EOF / SIGINT:** a missing stdin (piped input, EOF, or
+          ``KeyboardInterrupt``) returns silently — never raises.
+
+        Args:
+            prompt: The line to show the operator. Default is
+                ``"Press Enter to close…"``.
+        """
+        paused_live = False
+        if not self._plain and self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            paused_live = True
+
+        try:
+            self._console.print(f"\n  [bold cyan]{prompt}[/bold cyan]")
+            await asyncio.to_thread(input)
+        except (EOFError, KeyboardInterrupt):
+            pass
+        finally:
+            if paused_live and self._live is not None:
+                try:
+                    self._live.start()
+                    self._refresh()
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
@@ -320,7 +438,6 @@ class AgentDisplay:
     def __enter__(self) -> "AgentDisplay":
         if _NO_COLOR:
             self._plain = True
-            # No Rich Live — all output goes to plain print()
             return self
 
         self._live = Live(

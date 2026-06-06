@@ -42,6 +42,7 @@ from ai.provider import (
 )
 from ai.discovery.planner import PlannerAgent, Plan
 from ai.decision.executor import ExecutionAgent, ExecutionResult
+from ai.errors import classify
 from persistence import (
     ConvoStore,
     DEFAULT_DB_PATH,
@@ -55,72 +56,27 @@ from tui.display import AgentDisplay
 
 _console = Console()
 
-_RATE_LIMIT_HINTS: dict[str, str] = {
-    "gemini":    "Enable billing at console.cloud.google.com or use a paid API key.",
-    "anthropic": "Check your Anthropic credit balance at console.anthropic.com.",
-    "openai":    "Check your OpenAI billing at platform.openai.com.",
-    "groq":      "Free-tier Groq limits are per-minute — wait a moment and retry.",
-    "together":  "Check your Together AI usage at api.together.xyz.",
-    "ollama":    "Ollama is local — check that the model is pulled and the server is running.",
-}
-
 
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
-def _handle_api_error(exc: Exception, display: "AgentDisplay") -> None:
-    """Surface provider SDK errors as clean TUI messages."""
-    try:
-        import anthropic as _ant
-        _ant_rate = _ant.RateLimitError
-        _ant_auth = _ant.AuthenticationError
-    except (ImportError, AttributeError):
-        _ant_rate = _ant_auth = type(None)  # type: ignore[assignment]
-    try:
-        import openai as _oai
-        _oai_rate = _oai.RateLimitError
-        _oai_auth = _oai.AuthenticationError
-    except (ImportError, AttributeError):
-        _oai_rate = _oai_auth = type(None)  # type: ignore[assignment]
+def _handle_api_error(
+    exc: Exception,
+    display: "AgentDisplay",
+    *,
+    provider: str = "",
+) -> None:
+    """Classify *exc* and surface it through the display.
 
-    name = type(exc).__name__
-    msg  = str(exc)
-
-    if (
-        isinstance(exc, (_ant_rate, _oai_rate))
-        or "RateLimitError" in name
-        or "429" in msg
-        or "quota" in msg.lower()
-    ):
-        display.set_status("Failed")
-        display.log_thought("API quota / rate-limit error")
-        display.log_thought(msg.split("\n")[0][:200])
-    elif (
-        isinstance(exc, (_ant_auth, _oai_auth))
-        or "AuthenticationError" in name
-        or "401" in msg
-        or "invalid_api_key" in msg.lower()
-    ):
-        display.set_status("Failed")
-        display.log_thought("API authentication error — check your key")
-    elif isinstance(exc, asyncio.TimeoutError) or "timed out" in msg.lower():
-        display.set_status("Failed")
-        display.log_thought(
-            "Request timed out — provider may be slow or unreachable"
-        )
-    elif (
-        isinstance(exc, (httpx.ConnectError, httpx.NetworkError))
-        or "No connection" in msg
-        or "no connection" in msg.lower()
-        or "connect" in name.lower()
-    ):
-        display.set_status("Failed")
-        display.log_thought("No network connection")
-        display.log_thought("Check your internet and try again. This app requires connectivity.")
-    else:
-        display.set_status("Failed")
-        display.log_thought(f"{name}: {msg[:200]}")
+    All branching lives in :func:`ai.errors.classify`; this wrapper just
+    maps the resulting ``ErrorInfo`` onto TUI state (status badge + pinned
+    error line + thought stream). Provider-specific billing hints are baked
+    into the classifier when ``provider`` is supplied.
+    """
+    info = classify(exc, provider=provider, source="llm")
+    display.log_error(info)
+    display.set_status("Failed")
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +530,9 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             try:
                 validate_url(nav_url)
             except ValueError as exc:
-                display.log_thought(f"Blocked navigation to unsafe URL: {exc}")
+                info = classify(exc=exc, source="browser")
+                display.log_error(info)
+                display.set_status("Failed")
                 return
             stream_task = asyncio.create_task(_collect_stream())
             nav_ok = True
@@ -690,6 +648,8 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                                 display.log_thought(
                                     f"  ✗ {result.status_code}  {result.error}"
                                 )
+                                if result.error_info is not None:
+                                    display.log_error(result.error_info)
 
                     overall_success = all(r.success for r in results)
                     if overall_success or config.mock:
@@ -912,9 +872,10 @@ async def _repl(config: SessionConfig) -> None:
                 display.log_thought("Interrupted.")
             except Exception as exc:
                 _handle_api_error(exc, display)
-            # Hold the full-screen Live display so results stay visible before
-            # the alternate screen is restored and the REPL resumes.
-            await display.countdown_exit(3)
+            # Interactive runs: hold the full-screen display until the operator
+            # presses Enter so results stay readable before teardown.
+            # --no-interactive runs use the auto-countdown branch below.
+            await display.wait_for_enter()
 
     _console.print("\n  Goodbye.\n")
 

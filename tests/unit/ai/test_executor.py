@@ -308,7 +308,9 @@ async def test_execute_dispatch_exception_returns_failure_result():
     result = await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
     assert result.success is False
     assert result.status_code == 0
-    assert "ConnectError" in result.error or "Dispatch error" in result.error
+    assert result.error is not None
+    assert result.error_info is not None
+    assert result.error_info.category.value == "network"
 
 async def test_execute_generic_dispatch_exception_wraps_cleanly():
     dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
@@ -595,3 +597,63 @@ async def test_execute_mixed_none_and_real_value_calls_llm_refinement():
     )
     assert result.success is True
     exec_client.chat.assert_awaited_once()
+
+
+# ── Token reduction: prompt shape and max_tokens ───────────────────────────────
+
+async def test_execute_refine_payload_uses_compact_prompt_shape():
+    """Refinement prompt is compact ('Params:' / 'State:') — fewer tokens than the old form."""
+    dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
+    content = exec_client.chat.call_args.kwargs["messages"][0]["content"]
+    assert 'Params: {"x": 1}' in content
+    assert "Endpoint: /posts" in content
+    # The 'Suggested parameters:' verbose label is gone.
+    assert "Suggested parameters" not in content
+
+
+async def test_execute_refine_payload_omits_state_label_when_no_context():
+    """When the prior state is empty, the prompt must not contain 'State:'."""
+    dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
+    content = exec_client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "State:" not in content
+
+
+async def test_execute_refine_payload_includes_state_label_when_context_present():
+    """When a CompactStateModel is supplied, the prompt includes 'State:' and its context."""
+    from serialization.models import CompactStateModel
+    state = CompactStateModel(endpoint="/init", status_code=200, payload={"k": "v"})
+    dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1}, state=state)
+    content = exec_client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "State:" in content
+    assert "/init" in content
+
+
+async def test_execute_refine_payload_uses_bounded_max_tokens():
+    """The executor's max_tokens is bounded to keep per-call cost low."""
+    dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
+    call_kwargs = exec_client.chat.call_args.kwargs
+    assert call_kwargs["max_tokens"] <= 256
+
+
+async def test_execute_refine_payload_accepts_bare_json_fallback():
+    """If the model returns bare JSON (no fences), the executor parses it."""
+    dispatch, exec_client, rec_client = _build('{"x": 42, "y": "new"}')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
+    assert dispatch.post.await_args.args[1] == {"x": 42, "y": "new"}
+
+
+async def test_execute_refine_payload_falls_back_to_original_on_invalid_bare_json():
+    """Bare text that looks like JSON but fails to parse falls back to original parameters."""
+    dispatch, exec_client, rec_client = _build('{not: valid}')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
+    assert dispatch.post.await_args.args[1] == {"x": 1}

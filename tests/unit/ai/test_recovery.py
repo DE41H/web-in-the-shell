@@ -93,6 +93,7 @@ async def test_recovery_empty_content():
 # ---- error body handling ----
 
 async def test_recovery_truncates_long_error_body():
+    from ai.decision.recovery import _ERROR_BODY_BUDGET
     long_text = "x" * 3000
     failed = _resp(status_code=500, text=long_text)
     client = mock_llm_client(make_llm_text_response("ok"))
@@ -100,10 +101,10 @@ async def test_recovery_truncates_long_error_body():
     await agent.handle(failed, {}, "create_user")
 
     content = client.chat.call_args.kwargs["messages"][0]["content"]
-    idx = content.index("Error body:\n") + len("Error body:\n")
-    err_body = content[idx:]
-    assert err_body == "x" * 800
-    assert len(err_body) == 800
+    idx = content.index("Error:") + len("Error: ")
+    err_body = content[idx:].strip()
+    assert err_body == "x" * _ERROR_BODY_BUDGET
+    assert len(err_body) == _ERROR_BODY_BUDGET
 
 
 async def test_recovery_handles_unreadable_response():
@@ -280,7 +281,8 @@ async def test_recovery_max_tokens_at_least_512():
 # ── Sanitization order: truncate first, then sanitize ────────────────────────
 
 async def test_recovery_error_body_truncated_before_sanitize():
-    """error_body[:800] is applied before sanitize_for_llm so the input is bounded."""
+    """error_body is bounded before sanitize_for_llm so the input stays small."""
+    from ai.decision.recovery import _ERROR_BODY_BUDGET
     from unittest.mock import patch as _patch
 
     call_args_in_order = []
@@ -296,8 +298,82 @@ async def test_recovery_error_body_truncated_before_sanitize():
     with _patch("ai.decision.recovery.sanitize_for_llm", side_effect=tracking_sanitize):
         await agent.handle(_resp(text=long_text), {}, "action")
 
-    # The first sanitize call is for error_body; its input must be <= 800 chars
-    assert call_args_in_order[0] <= 800, (
+    # The first sanitize call is for error_body; its input must be <= budget
+    assert call_args_in_order[0] <= _ERROR_BODY_BUDGET, (
         f"sanitize_for_llm received {call_args_in_order[0]} chars; "
         f"truncation must happen BEFORE sanitization"
     )
+
+
+# ── new ABORT prefix variants ─────────────────────────────────────────────────
+
+async def test_recovery_abort_with_space_prefix():
+    """ABORT without colon (e.g. 'ABORT bad request') still aborts cleanly."""
+    client = mock_llm_client(make_llm_text_response("ABORT bad request"))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is False
+    assert result.abort_reason == "bad request"
+
+
+async def test_recovery_abort_retry_abort_prefix():
+    """RETRY-ABORT: is accepted as an abort signal."""
+    client = mock_llm_client(make_llm_text_response("RETRY-ABORT: hopeless"))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is False
+    assert result.abort_reason == "hopeless"
+
+
+async def test_recovery_abort_with_only_prefix_yields_fallback_reason():
+    """'ABORT:' with no body falls back to a default reason rather than empty."""
+    client = mock_llm_client(make_llm_text_response("ABORT:"))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is False
+    assert result.abort_reason
+    assert result.abort_reason != ""
+
+
+# ── Fenced JSON without 'json' tag is accepted ───────────────────────────────
+
+async def test_recovery_fenced_block_without_json_tag_is_accepted():
+    """``` (no 'json') fence around a dict is still parsed."""
+    client = mock_llm_client(make_llm_text_response('```\n{"k": "v"}\n```'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is True
+    assert result.revised_parameters == {"k": "v"}
+
+
+# ── Fenced JSON with non-dict content is rejected ─────────────────────────────
+
+async def test_recovery_fenced_block_with_list_is_rejected():
+    """```json fence around a list is rejected (we want revised_parameters, not a list)."""
+    client = mock_llm_client(make_llm_text_response('```json\n[1, 2, 3]\n```'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is False
+    assert "unparseable" in result.abort_reason.lower()
+
+
+# ── Bare JSON that is a list is rejected (already covered, locking it in) ────
+
+async def test_recovery_bare_list_outer_falls_through_to_unparseable():
+    client = mock_llm_client(make_llm_text_response('[1, 2, 3]'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "x")
+    assert result.retry is False
+    assert "unparseable" in result.abort_reason.lower()
+
+
+# ── Token reduction: prompt no longer contains the literal words 'Error body:' ─
+
+async def test_recovery_prompt_uses_compact_error_label():
+    """The recovery prompt now uses 'Error:' (not 'Error body:') to save tokens."""
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    await agent.handle(_resp(text="boom"), {}, "x")
+    content = client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Error: boom" in content
+    assert "Error body:" not in content

@@ -6,7 +6,8 @@ import re
 import sys
 from collections import deque
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from network.dispatch.client import DispatchClient
 from serialization.models import CompactStateModel
@@ -14,13 +15,21 @@ from ai.decision.recovery import RecoveryAgent
 from ai.discovery.planner import Plan
 from ai.provider import LLMClient
 
+if TYPE_CHECKING:
+    from ai.errors import ErrorInfo
+
 
 _MAX_RETRIES = 3
 _JSON_BLOCK_RE = re.compile(r"```json\s*([\s\S]+?)\s*```")
 
 _EXECUTOR_SYSTEM = (
-    "Construct the exact JSON body for an HTTP request. Output only a single ```json block."
+    "Construct the exact JSON body for an HTTP request. "
+    "Output only a single ```json block. No prose."
 )
+
+_EXECUTOR_MAX_TOKENS = 192
+
+_CONTEXT_BUDGET = 480
 
 
 @dataclass
@@ -30,6 +39,7 @@ class ExecutionResult:
     status_code: int
     response_body: dict | list | None = None
     error: str | None = None
+    error_info: "ErrorInfo | None" = None
 
 
 class ExecutionAgent:
@@ -62,11 +72,11 @@ class ExecutionAgent:
     ) -> ExecutionResult:
         context = state.to_llm_context() if state else ""
         m = method.upper()
-        # GET requests never send a body — skip the LLM refinement call entirely.
+        # GET/DELETE never send a body — skip the LLM refinement call entirely.
         # Also skip when parameters is empty (or all values are None) — no need to
         # ask the LLM to refine nothing.
         _params_empty = not parameters or all(v is None for v in parameters.values())
-        if m == "GET" or _params_empty:
+        if m in ("GET", "DELETE") or _params_empty:
             payload = parameters
         else:
             payload = await self._refine_payload(action, endpoint, parameters, context)
@@ -81,18 +91,19 @@ class ExecutionAgent:
                 elif m == "PATCH":
                     response = await self._dispatch.patch(endpoint, payload)
                 elif m == "DELETE":
-                    # DELETE requests have no body; non-empty parameters are forwarded
-                    # as URL query parameters so callers can pass filter/id fields.
                     delete_kwargs = {"params": payload} if payload else {}
                     response = await self._dispatch.delete(endpoint, **delete_kwargs)
                 else:
                     response = await self._dispatch.post(endpoint, payload)
             except Exception as exc:
+                from ai.errors import classify
+                error_info = classify(exc, source="executor")
                 return ExecutionResult(
                     success=False,
                     endpoint=endpoint,
                     status_code=0,
-                    error=f"Dispatch error ({type(exc).__name__}): {exc}",
+                    error=error_info.to_lines()[0] if error_info.to_lines() else str(exc),
+                    error_info=error_info,
                 )
             last_status = response.status_code
 
@@ -116,25 +127,39 @@ class ExecutionAgent:
             )
 
             if not recovery.retry or recovery.abort_reason:
+                from ai.errors import classify
+                error_info = classify(
+                    exc=None,
+                    status_code=last_status,
+                    detail=recovery.abort_reason or f"HTTP {last_status}",
+                    source="executor",
+                )
                 return ExecutionResult(
                     success=False,
                     endpoint=endpoint,
                     status_code=last_status,
                     error=recovery.abort_reason or f"HTTP {last_status}",
+                    error_info=error_info,
                 )
 
             payload = recovery.revised_parameters
 
-            # M3: 429 is handled by DispatchClient's token bucket and retry logic;
-            # only sleep here for 5xx errors to avoid compounding delays.
             if response.status_code >= 500:
                 await asyncio.sleep(min(2 ** attempt, 16))
 
+        from ai.errors import classify
+        error_info = classify(
+            exc=None,
+            status_code=last_status,
+            detail=f"Exhausted {_MAX_RETRIES} retries.",
+            source="executor",
+        )
         return ExecutionResult(
             success=False,
             endpoint=endpoint,
             status_code=last_status,
             error=f"Exhausted {_MAX_RETRIES} retries.",
+            error_info=error_info,
         )
 
     async def execute_plan(
@@ -159,7 +184,6 @@ class ExecutionAgent:
 
         steps = plan.steps
         if not steps:
-            # Backward-compat: treat the top-level fields as a single step
             endpoint = plan.target_endpoints[0] if plan.target_endpoints else ""
             steps = [
                 {
@@ -182,7 +206,6 @@ class ExecutionAgent:
             )
             results.append(result)
 
-            # M14: accumulate per-step LLM usage into total_usage
             if self.last_usage:
                 step_usage = self.last_usage
                 for key, val in step_usage.items():
@@ -207,13 +230,11 @@ class ExecutionAgent:
                     payload=payload,
                 ))
             if not result.success:
-                # Stop processing further steps; return partial results
                 break
 
         return results
 
     def _log_step_cost(self, step_num: int, usage: dict) -> None:
-        """Log per-step token cost to stderr for operator visibility."""
         inp = usage.get("input", 0)
         out = usage.get("output", 0)
         model = usage.get("model", "unknown")
@@ -229,19 +250,20 @@ class ExecutionAgent:
         parameters: dict,
         context: str,
     ) -> dict:
-        context = context[:800]
+        context = context[:_CONTEXT_BUDGET]
         prompt = (
             f"Action: {action}\n"
             f"Endpoint: {endpoint}\n"
-            f"Suggested parameters: {json.dumps(parameters)}\n"
-            f"Current application state:\n{context}"
-        ).strip()
+            f"Params: {json.dumps(parameters)}\n"
+        )
+        if context:
+            prompt += f"State: {context}\n"
 
         resp = await self._client.chat(
             system=_EXECUTOR_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
-            max_tokens=256,
+            max_tokens=_EXECUTOR_MAX_TOKENS,
         )
         self.last_usage = resp.usage
         text = resp.text
@@ -249,6 +271,14 @@ class ExecutionAgent:
         if match:
             try:
                 return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: the model may return bare JSON (no fences) — try once.
+        text = text.strip()
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                return json.loads(text)
             except json.JSONDecodeError:
                 pass
 

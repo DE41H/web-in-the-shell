@@ -41,12 +41,7 @@ def _deep_strip(obj: dict[str, Any], noise: frozenset[str]) -> dict[str, Any]:
     return result
 
 
-def _format_value(v: Any, max_len: int = 120) -> str:
-    """Format a payload value for LLM context output.
-
-    Dicts and lists are serialised as JSON so the LLM receives valid JSON
-    rather than Python repr notation.
-    """
+def _format_value(v: Any, max_len: int = 80) -> str:
     if isinstance(v, (dict, list)):
         return json.dumps(v, ensure_ascii=False)[:max_len]
     return str(v)[:max_len]
@@ -78,7 +73,7 @@ class CompactStateModel(BaseModel):
     def to_llm_context(self) -> str:
         path = urlparse(self.endpoint).path or self.endpoint
         lines = [f"{path} → {self.status_code}"]
-        for k, v in list(self.payload.items())[:8]:
+        for k, v in list(self.payload.items())[:6]:
             lines.append(f"{k}={_format_value(v)}")
         return sanitize_for_llm("\n".join(lines))
 

@@ -798,14 +798,15 @@ async def test_plan_nonempty_context_includes_label():
     assert "status=200" in intent_msg["content"]
 
 
-# ── History capped at 20 messages ─────────────────────────────────────────────
+# ── History capped at _MAX_HISTORY_MESSAGES ───────────────────────────────────
 
-async def test_plan_caps_past_messages_at_20(tmp_path: Path):
-    """Replayed conversation history is capped to the last 20 messages (10 turns)."""
+async def test_plan_caps_past_messages_at_max(tmp_path: Path):
+    """Replayed conversation history is capped to the planner's window."""
+    from ai.discovery.planner import _MAX_HISTORY_MESSAGES
+
     db_path = tmp_path / "wits.db"
     await init_db(db_path)
     async with ConvoStore(db_path) as store:
-        # Create a past convo with 30 messages (15 turns)
         msgs = [
             ConvoMessage(role="user" if i % 2 == 0 else "assistant", content=f"msg-{i}")
             for i in range(30)
@@ -833,14 +834,16 @@ async def test_plan_caps_past_messages_at_20(tmp_path: Path):
         await planner.plan("Long conversation")
 
     sent = client.chat.await_args.kwargs["messages"]
-    # Only past[-20:] + 1 new intent = 21 messages sent to LLM at most
-    # (plus tool_use/result appended after, but those are irrelevant here)
-    # The first 20 entries of sent should be past messages, the 21st is the intent
     past_in_sent = [
         m for m in sent
         if m["role"] in ("user", "assistant") and "msg-" in str(m.get("content", ""))
     ]
-    assert len(past_in_sent) <= 20, f"Expected ≤ 20 past messages, got {len(past_in_sent)}"
+    assert len(past_in_sent) <= _MAX_HISTORY_MESSAGES, (
+        f"Expected ≤ {_MAX_HISTORY_MESSAGES} past messages, got {len(past_in_sent)}"
+    )
+    assert past_in_sent[-1]["content"] == "msg-29", (
+        "Last past message should be the most recent (msg-29)"
+    )
 
 
 # ── Empty-search-results guidance ─────────────────────────────────────────────
@@ -927,7 +930,13 @@ async def test_handle_fallback_strips_openai_assistant_with_tool_calls():
     asst_msg = {
         "role": "assistant",
         "content": None,
-        "tool_calls": [{"id": "x", "type": "function", "function": {"name": "fn", "arguments": "{}"}}],
+        "tool_calls": [
+            {
+                "id": "x",
+                "type": "function",
+                "function": {"name": "fn", "arguments": "{}"},
+            }
+        ],
     }
     await planner.handle_fallback("find something", messages=[asst_msg])
 
@@ -952,7 +961,14 @@ async def test_handle_fallback_strips_anthropic_tool_use_content_blocks():
     planner._search_duckduckgo = AsyncMock(return_value="")
     tool_use_msg = {
         "role": "assistant",
-        "content": [{"type": "tool_use", "id": "tu1", "name": "fallback_search", "input": {"query": "x"}}],
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "fallback_search",
+                "input": {"query": "x"},
+            }
+        ],
     }
     tool_result_msg = {
         "role": "user",
@@ -1092,4 +1108,155 @@ async def test_handle_fallback_no_route_error_is_truncated():
     assert "Fallback planner produced no route_to_domain tool call" in msg
     assert wrong.text not in msg
     assert "LLMResponse(" not in msg
+
+
+# ── Token reduction: tighter system prompts and max_tokens ────────────────────
+
+async def test_plan_uses_bounded_max_tokens():
+    """The planner's max_tokens is bounded to keep per-call cost low."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    await planner.plan("Do the thing")
+    call_kwargs = client.chat.call_args.kwargs
+    assert call_kwargs["max_tokens"] <= 512
+
+
+async def test_fallback_uses_bounded_max_tokens():
+    """The fallback planner also uses a bounded max_tokens."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    await planner.handle_fallback("find a thing")
+    call_kwargs = client.chat.call_args.kwargs
+    assert call_kwargs["max_tokens"] <= 512
+
+
+async def test_plan_system_prompt_is_terse():
+    """System prompt no longer carries the 'web application domain' filler phrasing."""
+    from ai.discovery.planner import _SYSTEM
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/x"],
+            "action": "do",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    await planner.plan("Do it")
+    sent_system = client.chat.call_args.kwargs["system"]
+    # Sent system prompt matches the (terse) module constant exactly.
+    assert sent_system == _SYSTEM
+    # Length is bounded — no full essay.
+    assert len(sent_system) < 400
+
+
+# ── Provider-agnostic: planner accepts a non-Anthropic client and emits
+#    tool_calls in the OpenAI shape ───────────────────────────────────────────
+
+async def test_plan_with_openai_client_records_openai_tool_call_format():
+    """With an OpenAI-style client, last_messages records tool_calls (not content blocks)."""
+    from conftest import mock_llm_client
+    from ai.provider import LLMResponse, ToolCall
+
+    response = LLMResponse(
+        tool_calls=[ToolCall(
+            id="call_xyz",
+            name="route_to_domain",
+            input={
+                "domain": "https://api.example.com",
+                "endpoints": ["/posts"],
+                "action": "list",
+                "parameters": {},
+            },
+        )],
+        text="",
+        usage={"input": 1, "output": 1, "model": "gpt-4o"},
+        stop_reason="tool_calls",
+    )
+    client = mock_llm_client(response, provider="openai")
+    planner = PlannerAgent(client)
+    await planner.plan("List posts")
+
+    asst = next(
+        m for m in planner.last_messages
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    # The planner regenerates a tool_call id for storage (provider-agnostic uuid).
+    # What matters for cross-provider replay is that the id is non-empty.
+    assert asst["tool_calls"][0]["id"]
+    assert asst["tool_calls"][0]["function"]["name"] == "route_to_domain"
+    assert asst["tool_calls"][0]["function"]["arguments"]
+
+
+# ── Token reduction: history window is `_MAX_HISTORY_MESSAGES` (12), not 20 ───
+
+async def test_plan_history_window_default_is_12():
+    """_MAX_HISTORY_MESSAGES is the documented history cap (12 — ~6 turns)."""
+    from ai.discovery.planner import _MAX_HISTORY_MESSAGES
+    assert _MAX_HISTORY_MESSAGES <= 16
+    assert _MAX_HISTORY_MESSAGES >= 6
+
+
+# ── History cap keeps the most-recent message, not the oldest ─────────────────
+
+async def test_plan_caps_to_most_recent_messages(tmp_path: Path):
+    """When the past convo has 30 messages, only the last 12 are sent."""
+    from ai.discovery.planner import _MAX_HISTORY_MESSAGES
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    async with ConvoStore(db_path) as store:
+        msgs = [
+            ConvoMessage(role="user" if i % 2 == 0 else "assistant", content=f"msg-{i}")
+            for i in range(30)
+        ]
+        past = Convo(
+            id="long",
+            intent="Long convo",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            messages=msgs,
+            result=None,
+        )
+        await store.save(past)
+        client = mock_llm_client(make_llm_tool_response(
+            "route_to_domain",
+            {
+                "domain": "https://api.example.com",
+                "endpoints": ["/x"],
+                "action": "do",
+                "parameters": {},
+            },
+        ))
+        planner = PlannerAgent(client, convos=store)
+        await planner.plan("Long convo")
+
+    sent = client.chat.await_args.kwargs["messages"]
+    past_in_sent = [
+        m for m in sent
+        if "msg-" in str(m.get("content", ""))
+    ]
+    assert len(past_in_sent) == _MAX_HISTORY_MESSAGES
+    # Last kept message must be the most recent past one.
+    assert past_in_sent[-1]["content"] == "msg-29"
+    # First kept message is msg-(30 - 12)
+    assert past_in_sent[0]["content"] == f"msg-{30 - _MAX_HISTORY_MESSAGES}"
 

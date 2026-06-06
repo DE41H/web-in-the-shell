@@ -816,3 +816,185 @@ async def test_fetch_available_models_gemini_returns_fallback_when_all_filtered(
         result = await fetch_available_models("gemini", "api-key")
 
     assert result == [DEFAULT_MODELS["gemini"]]
+
+
+# ── _coerce_tool_args / _coerce_usage helpers ──────────────────────────────────
+
+
+def test_coerce_tool_args_none_returns_empty_dict():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args(None) == {}
+
+
+def test_coerce_tool_args_empty_string_returns_empty_dict():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args("") == {}
+
+
+def test_coerce_tool_args_dict_passes_through():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args({"a": 1, "b": "x"}) == {"a": 1, "b": "x"}
+
+
+def test_coerce_tool_args_json_string_is_parsed():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args('{"a": 1, "b": "x"}') == {"a": 1, "b": "x"}
+
+
+def test_coerce_tool_args_invalid_json_returns_empty_dict():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args("{not valid json}") == {}
+
+
+def test_coerce_tool_args_non_dict_json_returns_empty_dict():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args("[1, 2, 3]") == {}
+
+
+def test_coerce_tool_args_unsupported_type_returns_empty_dict():
+    from ai.provider import _coerce_tool_args
+    assert _coerce_tool_args(42) == {}
+
+
+def test_coerce_usage_none_returns_zero_zero():
+    from ai.provider import _coerce_usage
+    assert _coerce_usage(None) == {"input": 0, "output": 0, "model": ""}
+
+
+def test_coerce_usage_anthropic_style():
+    from ai.provider import _coerce_usage
+    usage = SimpleNamespace(input_tokens=12, output_tokens=34)
+    assert _coerce_usage(usage) == {"input": 12, "output": 34, "model": ""}
+
+
+def test_coerce_usage_openai_style():
+    from ai.provider import _coerce_usage
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+    assert _coerce_usage(usage) == {"input": 10, "output": 20, "model": ""}
+
+
+# ── stop_reason / finish_reason in response ───────────────────────────────────
+
+
+async def test_chat_anthropic_response_includes_stop_reason():
+    """Anthropic responses must surface stop_reason in LLMResponse.stop_reason."""
+    with patch("anthropic.AsyncAnthropic") as mock_cls:
+        backend = MagicMock()
+        backend.messages.create = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+                stop_reason="end_turn",
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("anthropic", "sk-test")
+        result = await client.chat(
+            system="s", messages=[{"role": "user", "content": "hi"}],
+            tools=[], max_tokens=64,
+        )
+    assert result.stop_reason == "end_turn"
+
+
+async def test_chat_openai_response_includes_finish_reason():
+    """OpenAI responses must surface finish_reason in LLMResponse.stop_reason."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(
+                    content="ok", tool_calls=None,
+                ))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="s", messages=[{"role": "user", "content": "hi"}],
+            tools=[], max_tokens=64,
+        )
+    assert result.stop_reason == "stop"
+
+
+async def test_chat_openai_tool_args_dict_passes_through():
+    """When the OpenAI adapter returns tool args already as a dict, it is accepted."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        tool_call = SimpleNamespace(
+            id="call_x",
+            function=SimpleNamespace(name="route_to_domain", arguments={"a": 1}),
+        )
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="tool_calls", message=SimpleNamespace(
+                    content="", tool_calls=[tool_call],
+                ))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="s", messages=[{"role": "user", "content": "hi"}],
+            tools=[_TEST_TOOL], max_tokens=64,
+        )
+    assert result.tool_calls[0].input == {"a": 1}
+
+
+async def test_chat_openai_tool_args_null_string_returns_empty():
+    """tool_call arguments='' (empty) is coerced to {}."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        tool_call = SimpleNamespace(
+            id="call_x",
+            function=SimpleNamespace(name="route_to_domain", arguments=""),
+        )
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[SimpleNamespace(finish_reason="tool_calls", message=SimpleNamespace(
+                    content="", tool_calls=[tool_call],
+                ))],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="s", messages=[{"role": "user", "content": "hi"}],
+            tools=[_TEST_TOOL], max_tokens=64,
+        )
+    assert result.tool_calls[0].input == {}
+
+
+# ── Provider client classes are tagged for dispatch ───────────────────────────
+
+
+def test_llm_client_anthropic_has_kind_anthropic():
+    with patch("anthropic.AsyncAnthropic") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        client = LLMClient("anthropic", "k")
+    assert client._kind == "anthropic"
+
+
+def test_llm_client_openai_has_kind_openai():
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        client = LLMClient("openai", "k")
+    assert client._kind == "openai"
+
+
+def test_llm_client_gemini_has_kind_openai():
+    """Gemini uses the OpenAI-compatible transport — _kind must be 'openai'."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        client = LLMClient("gemini", "k")
+    assert client._kind == "openai"
+
+
+def test_llm_client_ollama_has_kind_openai():
+    """Ollama uses the OpenAI-compatible transport — _kind must be 'openai'."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        mock_cls.return_value = MagicMock()
+        client = LLMClient("ollama", "")
+    assert client._kind == "openai"
