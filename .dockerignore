@@ -1,0 +1,49 @@
+# ── Version control ───────────────────────────────────────────────────────────
+.git/
+.gitignore
+
+# ── Python artefacts ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# ── Virtual environments (stage 1 produces a fresh one inside the build) ──────
+.venv/
+venv/
+env/
+
+# ── Test suite & dev tooling (never needed at runtime) ────────────────────────
+tests/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.log
+
+# ── Local data / secrets ──────────────────────────────────────────────────────
+*.db
+.env
+.env.*
+
+# ── Docs & project meta ───────────────────────────────────────────────────────
+*.md
+AGENTS.md
+PROBLEM.md
+
+# ── Editor / OS noise ─────────────────────────────────────────────────────────
+*.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Claude Code config & memory ───────────────────────────────────────────────
+.claude/
+
+# ── Docker files themselves (no need to copy into the build context) ──────────
+docker/
+.dockerignore

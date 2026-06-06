@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# uv
+.venv/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Linting
+.ruff_cache/
+
+# Environments
+.env
+.env.local
+.env.*.local
+.venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Persistence (local sqlite database)
+wits.db
+wits.db-journal
+wits.db-wal
+wits.db-shm
