@@ -206,8 +206,10 @@ _SYSTEM = (
 
 _FALLBACK_SYSTEM = (
     "Discovery agent for a headless AI browser. Given a search query and optional "
-    "search results, identify the single most likely real production domain and its "
-    "API structure, then call route_to_domain.\n"
+    "search results, identify multiple relevant production domains and their "
+    "API structures, then call route_to_domain.\n"
+    "• When the user intent implies a list or multiple results (e.g., 'top 3 pubs', 'list all users'), "
+    "prioritize identifying all relevant API endpoints for retrieving such lists.\n"
     "• domain must be scheme + host only (e.g. https://www.example.com) — no path.\n"
     "• Include candidate_domains with www/non-www or regional alternatives when "
     "uncertain.\n"
@@ -475,9 +477,9 @@ class PlannerAgent:
                 "Use your knowledge to infer the best domain and API structure.\n\n"
             )
         content += (
-            "Based on the above, identify the most likely web application domain "
-            "and API endpoints needed to fulfil the intent. Call route_to_domain."
-        )
+            "Based on the above, identify all likely web application domains "
+            "and API endpoints needed to fulfil the intent, especially if the intent "
+            "implies a list of results (e.g., 'top 3 pubs'). Call route_to_domain."        )
 
         # H1: keep the full message list for history storage
         history: list[dict[str, Any]] = list(messages) if messages else []

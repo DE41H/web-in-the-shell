@@ -26,6 +26,7 @@ class StealthBrowser:
                 "--disable-dev-shm-usage",
                 "--disable-extensions",
                 "--disable-setuid-sandbox",
+                "--disable-http2",
             ],
         )
         self._context = await self._browser.new_context(
@@ -91,6 +92,7 @@ class StealthBrowser:
                 "--disable-dev-shm-usage",
                 "--disable-extensions",
                 "--disable-setuid-sandbox",
+                "--disable-http2",
             ],
         )
         try:

@@ -709,6 +709,14 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             planner = PlannerAgent(main_client, convos=convos)
             try:
                 plan = await planner.plan(safe_intent)
+            except ValueError as exc:
+                if str(exc) == 'Planner produced no actionable tool call':
+                    detailed_error_context = f"Initial plan failed: {exc}. Attempting fallback."
+                    plan = await planner.handle_fallback(safe_intent, messages=planner.last_messages, context=detailed_error_context)
+                else:
+                    display.set_status("Failed")
+                    display.log_thought(f"Planning failed: {exc}")
+                    return
             except Exception as exc:
                 display.set_status("Failed")
                 display.log_thought(f"Planning failed: {exc}")
@@ -818,7 +826,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         display.log_thought("URL validation failed — requesting new plan…")
                         planner = PlannerAgent(main_client, convos=convos)
                         plan = await planner.plan(
-                            safe_intent, context=f"Navigation to {nav_url} failed: {exc}"
+                            safe_intent, context=f"Navigation to {nav_url} failed. {info.title}: {info.detail}"
                         )
                         last_planner = planner
                         target = config.target or plan.target_domain
