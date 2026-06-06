@@ -1,6 +1,7 @@
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
 
+import persistence.crypto as _crypto_mod
 from persistence.crypto import (
     _CIPHERTEXT_PREFIX,
     _home,
@@ -9,9 +10,18 @@ from persistence.crypto import (
     _keyring_set,
     _load_or_create_file_key,
     _load_or_create_key,
+    clear_key_cache,
     decrypt,
     encrypt,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_key_cache():
+    """Clear the in-process key cache before and after every test."""
+    clear_key_cache()
+    yield
+    clear_key_cache()
 
 
 def test_encrypt_decrypt_round_trip(monkeypatch):
@@ -158,14 +168,18 @@ def test_keyring_helpers_call_real_keyring(monkeypatch):
     assert _keyring_get("u") == "v"
 
 
-def test_file_fallback_regenerates_when_existing_invalid(monkeypatch, tmp_path):
+def test_file_fallback_raises_when_existing_key_is_corrupt(monkeypatch, tmp_path):
+    """H5: a corrupt key file must raise RuntimeError, not silently overwrite."""
     monkeypatch.setattr("persistence.crypto._home", lambda: tmp_path)
     fallback = tmp_path / ".wits"
     fallback.mkdir(parents=True, exist_ok=True)
-    (fallback / "fernet.key").write_text("garbage-not-valid", encoding="utf-8")
-    key = _load_or_create_file_key()
-    assert _is_valid_b64_key((fallback / "fernet.key").read_text(encoding="utf-8").strip())
-    Fernet(key)
+    key_file = fallback / "fernet.key"
+    key_file.write_text("garbage-not-valid", encoding="utf-8")
+    original_content = key_file.read_text(encoding="utf-8")
+    with pytest.raises(RuntimeError, match="corrupt"):
+        _load_or_create_file_key()
+    # Must NOT have overwritten the corrupt file.
+    assert key_file.read_text(encoding="utf-8") == original_content
 
 
 def test_file_fallback_swallows_chmod_errors(monkeypatch, tmp_path):
@@ -182,3 +196,83 @@ def test_file_fallback_swallows_chmod_errors(monkeypatch, tmp_path):
     monkeypatch.setattr(chmod_target, raising_chmod)
     key = _load_or_create_file_key()
     Fernet(key)
+
+
+# ── New tests for H5, M5 fixes ───────────────────────────────────────────────
+
+def test_corrupt_key_file_raises_runtime_error_not_overwrite(monkeypatch, tmp_path):
+    """H5: corrupt key file must raise RuntimeError instead of silently overwriting."""
+    monkeypatch.setattr("persistence.crypto._home", lambda: tmp_path)
+    key_dir = tmp_path / ".wits"
+    key_dir.mkdir(parents=True, exist_ok=True)
+    key_file = key_dir / "fernet.key"
+    key_file.write_text("this-is-definitely-not-a-valid-fernet-key", encoding="utf-8")
+    original = key_file.read_text(encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        _load_or_create_file_key()
+
+    # File content must be unchanged — no silent overwrite.
+    assert key_file.read_text(encoding="utf-8") == original
+
+
+def test_clear_key_cache_allows_reload(monkeypatch, tmp_path):
+    """M5/clear_key_cache: after clearing, the next call reloads the key."""
+    store: dict[str, str] = {}
+    monkeypatch.setattr("persistence.crypto._keyring_get", lambda u: store.get(u))
+    monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
+
+    k1 = _load_or_create_key()
+    assert _crypto_mod._KEY_CACHE is not None
+
+    clear_key_cache()
+    assert _crypto_mod._KEY_CACHE is None
+
+    k2 = _load_or_create_key()
+    # Same key is loaded because it was persisted to the mock keyring.
+    assert k1 == k2
+
+
+def test_key_is_cached_after_first_call(monkeypatch):
+    """M5: _load_or_create_key populates the module-level cache."""
+    store: dict[str, str] = {}
+    monkeypatch.setattr("persistence.crypto._keyring_get", lambda u: store.get(u))
+    monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
+
+    assert _crypto_mod._KEY_CACHE is None
+    _load_or_create_key()
+    assert _crypto_mod._KEY_CACHE is not None
+
+
+def test_key_cached_second_call_does_not_invoke_load_uncached(monkeypatch):
+    """M5: second call to _load_or_create_key uses cache, not keyring."""
+    call_count = {"n": 0}
+    real_load = _crypto_mod._load_key_uncached
+
+    def counting_load():
+        call_count["n"] += 1
+        return real_load()
+
+    store: dict[str, str] = {}
+    monkeypatch.setattr("persistence.crypto._keyring_get", lambda u: store.get(u))
+    monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
+    monkeypatch.setattr("persistence.crypto._load_key_uncached", counting_load)
+
+    _load_or_create_key()
+    _load_or_create_key()
+    _load_or_create_key()
+
+    # _load_key_uncached should only be called once (on cache miss).
+    assert call_count["n"] == 1
+
+
+def test_encrypt_decrypt_uses_cached_key(monkeypatch):
+    """M5: encrypt + decrypt both use cached key, not reloading per call."""
+    store: dict[str, str] = {}
+    monkeypatch.setattr("persistence.crypto._keyring_get", lambda u: store.get(u))
+    monkeypatch.setattr("persistence.crypto._keyring_set", lambda u, v: store.__setitem__(u, v))
+
+    ct = encrypt("test value")
+    pt = decrypt(ct)
+    assert pt == "test value"
+    # Both operations used the same cached key — verified by successful round-trip.

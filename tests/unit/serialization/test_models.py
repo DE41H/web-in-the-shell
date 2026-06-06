@@ -86,12 +86,23 @@ class TestNoiseKeysAndDeepStrip:
         )
         assert out == {"id": 1, "user": {"id": 2}}
 
-    def test_deep_strip_does_not_recurse_into_lists(self):
+    def test_deep_strip_recurses_into_list_items(self):
         out = _deep_strip(
             {"id": 1, "items": [{"tracking": "x", "name": "a"}]},
             _NOISE_KEYS,
         )
-        assert out == {"id": 1, "items": [{"tracking": "x", "name": "a"}]}
+        assert out == {"id": 1, "items": [{"name": "a"}]}
+
+    def test_deep_strip_preserves_non_dict_list_items(self):
+        out = _deep_strip({"tags": ["alpha", "beta"]}, _NOISE_KEYS)
+        assert out == {"tags": ["alpha", "beta"]}
+
+    def test_deep_strip_mixed_list(self):
+        out = _deep_strip(
+            {"items": [{"tracking": "x", "id": 1}, "plain", 42]},
+            _NOISE_KEYS,
+        )
+        assert out == {"items": [{"id": 1}, "plain", 42]}
 
     def test_deep_strip_empty_dict(self):
         assert _deep_strip({}, _NOISE_KEYS) == {}
@@ -135,7 +146,7 @@ class TestCompactStateModelStripNoise:
         )
         assert m.payload == {"id": 1, "user": {"id": 2}}
 
-    def test_list_items_not_recursed(self):
+    def test_list_items_are_recursed(self):
         m = CompactStateModel(
             endpoint="https://x.test/p",
             status_code=200,
@@ -146,7 +157,7 @@ class TestCompactStateModelStripNoise:
         )
         assert m.payload == {
             "id": 1,
-            "items": [{"tracking": "x", "name": "a"}, {"name": "b"}],
+            "items": [{"name": "a"}, {"name": "b"}],
         }
 
     def test_data_testid_and_classname_removed(self):
@@ -282,6 +293,37 @@ class TestToLlmContext:
         # New format: single "{path} → {status}" line when payload is empty
         assert out == "/p → 200"
 
+    def test_dict_value_emits_json_not_repr(self):
+        m = CompactStateModel(
+            endpoint="https://x.test/p",
+            status_code=200,
+            payload={"user": {"k": "v"}},
+        )
+        out = m.to_llm_context()
+        # JSON uses double-quotes; Python repr uses single-quotes
+        assert '{"k": "v"}' in out
+        assert "{'k': 'v'}" not in out
+
+    def test_list_value_emits_json_not_repr(self):
+        m = CompactStateModel(
+            endpoint="https://x.test/p",
+            status_code=200,
+            payload={"tags": ["a", "b"]},
+        )
+        out = m.to_llm_context()
+        # JSON array with double-quoted strings
+        assert '["a", "b"]' in out
+        assert "['a', 'b']" not in out
+
+    def test_scalar_value_emits_str(self):
+        m = CompactStateModel(
+            endpoint="https://x.test/p",
+            status_code=200,
+            payload={"count": 42},
+        )
+        out = m.to_llm_context()
+        assert "count=42" in out
+
 
 # ---------------------------------------------------------------------------
 # CompactStateModel.compact_size
@@ -379,6 +421,30 @@ class TestCompactFromCapture:
         m = compact_from_capture(cap)
         assert m.endpoint == "https://x.test/x"
         assert m.status_code == 404
+
+    def test_scalar_json_body_treated_as_empty_payload(self):
+        # A scalar JSON response (e.g. a bare number or string) is not a dict
+        # or list — compact_from_capture should return an empty payload.
+        cap = CapturedResponse(
+            url="https://x.test/p",
+            status=200,
+            headers={"content-type": "application/json"},
+            body=b"42",
+            json=42,
+        )
+        m = compact_from_capture(cap)
+        assert m.payload == {}
+
+    def test_boolean_json_body_treated_as_empty_payload(self):
+        cap = CapturedResponse(
+            url="https://x.test/p",
+            status=200,
+            headers={"content-type": "application/json"},
+            body=b"true",
+            json=True,
+        )
+        m = compact_from_capture(cap)
+        assert m.payload == {}
 
 
 # ---------------------------------------------------------------------------

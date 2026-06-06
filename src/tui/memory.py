@@ -13,7 +13,11 @@ from persistence import Convo, ConvoStore, init_db
 
 
 _PROMPT: Callable[[str], str] = Prompt.ask
-_CONFIRM: Callable[[str, bool], bool] = Confirm.ask
+
+
+def _CONFIRM(prompt: str, default: bool = False) -> bool:  # noqa: N802
+    """Wrap Confirm.ask so ``default`` is always passed as a keyword argument."""
+    return Confirm.ask(prompt, default=default)
 
 
 def _help_text() -> str:

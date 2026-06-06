@@ -30,7 +30,7 @@ class DispatchClient:
         max_concurrent: int = 5,
         requests_per_second: float = 5.0,
         burst: int = 10,
-        max_retries: int = 1,
+        max_retries: int = 2,
     ) -> None:
         self._session = session
         self._base_url = base_url
@@ -47,7 +47,6 @@ class DispatchClient:
             validate_url(self._base_url)  # SSRF guard — checked once at client open time
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
-            cookies=httpx.Cookies(self._session.credentials.cookies),
             timeout=httpx.Timeout(30.0),
             follow_redirects=True,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
@@ -60,7 +59,11 @@ class DispatchClient:
             self._client = None
 
     def _live_headers(self) -> dict[str, str]:
-        return self._session.credentials.as_headers()
+        h = self._session.credentials.as_headers()
+        creds = self._session.credentials
+        if creds.cookies:
+            h["Cookie"] = "; ".join(f"{k}={v}" for k, v in creds.cookies.items())
+        return h
 
     def _guard(self, endpoint: str) -> None:
         assert self._client, "Use 'async with DispatchClient()'"
@@ -93,8 +96,13 @@ class DispatchClient:
             )
             if response.status_code != 429 or attempt >= self._max_retries:
                 return response
-            delay = await parse_retry_after(response.headers.get("retry-after"))
-            if delay <= 0:
+            retry_after_hdr = response.headers.get("retry-after")
+            if retry_after_hdr is not None:
+                # Server provided a Retry-After header — honor it exactly.
+                # parse_retry_after("0") returns 0.0, meaning retry immediately.
+                delay: float = parse_retry_after(retry_after_hdr)
+            else:
+                # No Retry-After header — fall back to exponential backoff.
                 delay = float(2 ** attempt)
             await asyncio.sleep(delay)
             attempt += 1
@@ -118,3 +126,8 @@ class DispatchClient:
         self._guard(endpoint)
         async with self._sem:
             return await self._do("PATCH", endpoint, json=payload, **kwargs)
+
+    async def delete(self, url: str, **kwargs) -> httpx.Response:
+        self._guard(url)
+        async with self._sem:
+            return await self._do("DELETE", url, **kwargs)

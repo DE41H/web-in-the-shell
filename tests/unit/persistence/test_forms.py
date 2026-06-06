@@ -1,9 +1,11 @@
 """Tests for FormFieldStore — form field persistence and sensitivity filtering."""
 
 import asyncio
+import sqlite3
 
 import pytest
 
+from persistence.crypto import _CIPHERTEXT_PREFIX, decrypt
 from persistence.db import init_db
 from persistence.forms import FormFieldStore, _is_sensitive
 
@@ -207,3 +209,132 @@ def test_require_conn_raises_outside_context(tmp_path):
     store = FormFieldStore(tmp_path / "test.db")
     with pytest.raises(RuntimeError, match="async with"):
         asyncio.run(store.get("example.com", "email"))
+
+
+# ── New tests for M4 (encryption) and H6 (InvalidToken) fixes ────────────────
+
+async def test_saved_value_is_encrypted_on_disk(tmp_path):
+    """M4: values stored in form_fields must be Fernet ciphertext on disk."""
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "username", "text", "alice")
+
+    # Read raw value directly from DB.
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM form_fields WHERE domain = ? AND field_name = ?",
+            ("example.com", "username"),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    raw = row[0]
+    assert raw.startswith(_CIPHERTEXT_PREFIX), f"expected ciphertext, got: {raw!r}"
+    assert "alice" not in raw  # plaintext must not appear in the stored blob
+    # Decrypt round-trip must yield original value.
+    assert decrypt(raw) == "alice"
+
+
+async def test_get_decrypts_stored_value(tmp_path):
+    """M4: get() must decrypt and return the original plaintext value."""
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "email", "email", "user@example.com")
+        result = await store.get("example.com", "email")
+    assert result == "user@example.com"
+
+
+async def test_get_all_for_domain_decrypts_values(tmp_path):
+    """M4: get_all_for_domain() must decrypt all values before returning."""
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "email", "email", "user@example.com")
+        await store.save("example.com", "username", "text", "alice")
+        result = await store.get_all_for_domain("example.com")
+
+    assert result["email"] == "user@example.com"
+    assert result["username"] == "alice"
+
+
+async def test_get_invalid_token_returns_none_with_warning(tmp_path):
+    """H6: InvalidToken in get() returns None and emits a warning."""
+    import warnings as _warnings
+    from unittest.mock import patch
+    from cryptography.fernet import InvalidToken as _IT
+
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "username", "text", "alice")
+
+    with patch("persistence.forms.decrypt", side_effect=_IT("bad token")):
+        async with FormFieldStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                result = await store.get("example.com", "username")
+
+    assert result is None
+    assert len(w) == 1
+    assert "corrupt" in str(w[0].message).lower() or "rotation" in str(w[0].message).lower()
+
+
+async def test_get_all_for_domain_invalid_token_skips_row_with_warning(tmp_path):
+    """H6: InvalidToken in get_all_for_domain() skips the bad row and warns."""
+    import warnings as _warnings
+    from unittest.mock import patch
+    from cryptography.fernet import InvalidToken as _IT
+
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "email", "email", "user@example.com")
+        await store.save("example.com", "username", "text", "alice")
+
+    call_count = {"n": 0}
+    real_decrypt = decrypt
+
+    def sometimes_fail(ct: str) -> str:
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise _IT("simulated rotation")
+        return real_decrypt(ct)
+
+    with patch("persistence.forms.decrypt", side_effect=sometimes_fail):
+        async with FormFieldStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                result = await store.get_all_for_domain("example.com")
+
+    # One field decrypted, one skipped.
+    assert len(result) == 1
+    assert any(
+        "corrupt" in str(wi.message).lower() or "rotation" in str(wi.message).lower()
+        for wi in w
+    )
+
+
+async def test_encrypted_value_survives_upsert(tmp_path):
+    """M4: upsert (save twice) must re-encrypt the new value, not store plaintext."""
+    db_path = tmp_path / "test.db"
+    await init_db(db_path)
+    async with FormFieldStore(db_path) as store:
+        await store.save("example.com", "username", "text", "alice")
+        await store.save("example.com", "username", "text", "bob")
+        result = await store.get("example.com", "username")
+
+    assert result == "bob"
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM form_fields WHERE domain = ? AND field_name = ?",
+            ("example.com", "username"),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row[0].startswith(_CIPHERTEXT_PREFIX)
+    assert decrypt(row[0]) == "bob"

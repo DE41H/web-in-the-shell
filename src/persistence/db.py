@@ -1,10 +1,16 @@
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
 
 
 DEFAULT_DB_PATH = Path(os.environ.get("WITS_DB_PATH", "./wits.db"))
+
+
+def utcnow_iso() -> str:
+    """Return the current UTC time as an ISO-8601 string (timezone-aware)."""
+    return datetime.now(UTC).isoformat()
 
 
 _SCHEMA = [

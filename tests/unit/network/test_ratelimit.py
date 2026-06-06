@@ -34,21 +34,35 @@ async def test_acquire_refills_over_time():
     assert bucket.available() == pytest.approx(5.0, abs=0.1)
 
 
-async def test_parse_retry_after_seconds():
-    assert await parse_retry_after("5") == 5.0
-    assert await parse_retry_after("0.25") == 0.25
+def test_parse_retry_after_seconds():
+    assert parse_retry_after("5") == 5.0
+    assert parse_retry_after("0.25") == 0.25
 
 
-async def test_parse_retry_after_http_date():
-    assert await parse_retry_after("Wed, 21 Oct 2099 07:28:00 GMT") > 1_000_000
-    assert await parse_retry_after("Wed, 21 Oct 2000 07:28:00 GMT") == 0.0
-    assert await parse_retry_after("Wed, 21 Oct 2099 07:28:00") > 1_000_000
+def test_parse_retry_after_http_date():
+    assert parse_retry_after("Wed, 21 Oct 2099 07:28:00 GMT") > 1_000_000
+    assert parse_retry_after("Wed, 21 Oct 2000 07:28:00 GMT") == 0.0
+    assert parse_retry_after("Wed, 21 Oct 2099 07:28:00") > 1_000_000
 
 
-async def test_parse_retry_after_none_returns_zero():
-    assert await parse_retry_after(None) == 0.0
-    assert await parse_retry_after("") == 0.0
+def test_parse_retry_after_none_returns_zero():
+    assert parse_retry_after(None) == 0.0
+    assert parse_retry_after("") == 0.0
 
 
-async def test_parse_retry_after_invalid_returns_zero():
-    assert await parse_retry_after("not-a-date-or-number") == 0.0
+def test_parse_retry_after_invalid_returns_zero():
+    assert parse_retry_after("not-a-date-or-number") == 0.0
+
+
+def test_parse_retry_after_is_sync_not_coroutine():
+    """M6 — parse_retry_after must be a plain function, not async."""
+    import inspect
+    result = parse_retry_after("1")
+    assert not inspect.iscoroutine(result), "parse_retry_after must not be async"
+    assert result == 1.0
+
+
+def test_parse_retry_after_zero_returns_zero_not_negative():
+    """M7 — Retry-After: 0 means retry immediately; must return 0.0."""
+    assert parse_retry_after("0") == 0.0
+    assert parse_retry_after("0.0") == 0.0

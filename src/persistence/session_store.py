@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import datetime
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import aiosqlite
 from network.session.manager import SessionCredentials
 
 from persistence.crypto import decrypt, encrypt
+from persistence.db import utcnow_iso
 
 
 class SessionStore:
@@ -64,10 +66,18 @@ class SessionStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        cookies_plain = decrypt(row[0]) if row[0] else None
-        bearer_plain = decrypt(row[1]) if row[1] else None
-        csrf_plain = decrypt(row[2]) if row[2] else None
-        extra_plain = decrypt(row[3]) if row[3] else None
+        try:
+            cookies_plain = decrypt(row[0]) if row[0] else None
+            bearer_plain = decrypt(row[1]) if row[1] else None
+            csrf_plain = decrypt(row[2]) if row[2] else None
+            extra_plain = decrypt(row[3]) if row[3] else None
+        except Exception as exc:
+            warnings.warn(
+                f"SessionStore.get: failed to decrypt row for host '{host}': {exc}; "
+                "skipping row (key rotation or DB corruption).",
+                stacklevel=2,
+            )
+            return None
         return SessionCredentials(
             cookies=json.loads(cookies_plain) if cookies_plain else {},
             bearer_token=bearer_plain,
@@ -77,7 +87,7 @@ class SessionStore:
 
     async def save(self, host: str, creds: SessionCredentials) -> None:
         conn = self._require_conn()
-        now = datetime.now().isoformat()
+        now = utcnow_iso()
         await conn.execute(
             """
             INSERT OR REPLACE INTO sessions
@@ -112,10 +122,18 @@ class SessionStore:
             rows = await cur.fetchall()
         out: list[tuple[str, SessionCredentials, datetime]] = []
         for host, cookies_ct, bearer_ct, csrf_ct, extra_ct, updated_at in rows:
-            cookies_plain = decrypt(cookies_ct) if cookies_ct else None
-            bearer_plain = decrypt(bearer_ct) if bearer_ct else None
-            csrf_plain = decrypt(csrf_ct) if csrf_ct else None
-            extra_plain = decrypt(extra_ct) if extra_ct else None
+            try:
+                cookies_plain = decrypt(cookies_ct) if cookies_ct else None
+                bearer_plain = decrypt(bearer_ct) if bearer_ct else None
+                csrf_plain = decrypt(csrf_ct) if csrf_ct else None
+                extra_plain = decrypt(extra_ct) if extra_ct else None
+            except Exception as exc:
+                warnings.warn(
+                    f"SessionStore.list_all: failed to decrypt row for host '{host}': {exc}; "
+                    "skipping row (key rotation or DB corruption).",
+                    stacklevel=2,
+                )
+                continue
             creds = SessionCredentials(
                 cookies=json.loads(cookies_plain) if cookies_plain else {},
                 bearer_token=bearer_plain,

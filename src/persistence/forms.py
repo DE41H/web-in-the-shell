@@ -1,12 +1,13 @@
 """Persistent store for auto-filled form field values."""
 
 import re
-from datetime import datetime, UTC
+import warnings
 from pathlib import Path
 
 import aiosqlite
 
-from persistence.db import DEFAULT_DB_PATH
+from persistence.crypto import decrypt, encrypt
+from persistence.db import DEFAULT_DB_PATH, utcnow_iso
 from security.redact import redact as _redact
 
 # Fields whose names match this pattern are never stored (too sensitive)
@@ -54,7 +55,17 @@ class FormFieldStore:
             (domain, field_name),
         )
         row = await cur.fetchone()
-        return row["value"] if row else None
+        if row is None:
+            return None
+        try:
+            return decrypt(row["value"])
+        except Exception as exc:
+            warnings.warn(
+                f"FormFieldStore.get: failed to decrypt value for ({domain!r}, "
+                f"{field_name!r}): {exc}; returning None (key rotation or DB corruption).",
+                stacklevel=2,
+            )
+            return None
 
     async def save(
         self, domain: str, field_name: str, field_type: str, value: str
@@ -63,8 +74,8 @@ class FormFieldStore:
         if _is_sensitive(field_type, field_name):
             return  # never store sensitive fields
         conn = self._require_conn()
-        now = datetime.now(UTC).isoformat()
-        safe_value = _redact(value)
+        now = utcnow_iso()
+        safe_value = encrypt(_redact(value))
         await conn.execute(
             """
             INSERT INTO form_fields (domain, field_name, field_type, value, updated_at)
@@ -86,7 +97,18 @@ class FormFieldStore:
             (domain,),
         )
         rows = await cur.fetchall()
-        return {row["field_name"]: row["value"] for row in rows}
+        result: dict[str, str] = {}
+        for row in rows:
+            try:
+                result[row["field_name"]] = decrypt(row["value"])
+            except Exception as exc:
+                warnings.warn(
+                    f"FormFieldStore.get_all_for_domain: failed to decrypt value for "
+                    f"({domain!r}, {row['field_name']!r}): {exc}; skipping row "
+                    "(key rotation or DB corruption).",
+                    stacklevel=2,
+                )
+        return result
 
     async def delete(self, domain: str, field_name: str) -> int:
         """Delete a single saved field. Returns 1 if deleted, 0 if not found."""

@@ -15,6 +15,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 
 # Default primary model per provider
 DEFAULT_MODELS: dict[str, str] = {
@@ -60,6 +62,7 @@ PROVIDER_ENV_VARS: dict[str, str] = {
 class ToolCall:
     name: str
     input: dict
+    id: str = ""  # tool_use block ID for Anthropic conversation replay
 
 
 @dataclass
@@ -136,15 +139,18 @@ class LLMClient:
         except TimeoutError:
             raise RuntimeError(f"LLM API timed out after 60s ({self.provider}/{self.model}).")
         except Exception as exc:
-            name = type(exc).__name__.lower()
-            if "connect" in name or "network" in name or "connect" in str(exc).lower():
+            import anthropic as _anthropic
+            if isinstance(exc, (_anthropic.APIConnectionError, httpx.ConnectError,
+                                 httpx.NetworkError)):
                 raise RuntimeError(f"No connection to {self.provider} API: {exc}") from exc
             raise
 
         calls, text = [], ""
         for block in resp.content:
             if block.type == "tool_use":
-                calls.append(ToolCall(name=block.name, input=block.input))
+                calls.append(ToolCall(
+                    name=block.name, input=block.input, id=getattr(block, "id", "")
+                ))
             elif block.type == "text":
                 text = block.text
 
@@ -180,8 +186,9 @@ class LLMClient:
         except TimeoutError:
             raise RuntimeError(f"LLM API timed out after 60s ({self.provider}/{self.model}).")
         except Exception as exc:
-            name = type(exc).__name__.lower()
-            if "connect" in name or "network" in name or "connect" in str(exc).lower():
+            import openai as _openai
+            if isinstance(exc, (_openai.APIConnectionError, httpx.ConnectError,
+                                 httpx.NetworkError)):
                 raise RuntimeError(f"No connection to {self.provider} API: {exc}") from exc
             raise
 

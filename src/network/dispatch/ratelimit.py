@@ -47,11 +47,12 @@ class TokenBucket:
             await asyncio.sleep(wait)
 
 
-async def parse_retry_after(value: str | None) -> float:
+def parse_retry_after(value: str | None) -> float:
     """Parse a ``Retry-After`` header value. Return seconds to wait (>= 0).
 
     Accepts a non-negative integer/float (seconds) or an RFC 7231
     HTTP-date. Returns 0.0 for ``None``, empty, or unparseable input.
+    A value of 0.0 means retry immediately (server said Retry-After: 0).
     """
     if not value:
         return 0.0

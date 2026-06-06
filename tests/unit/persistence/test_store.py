@@ -301,3 +301,130 @@ async def test_encrypted_row_is_backwards_compatible_with_plaintext(tmp_path: Pa
     payload = decrypt(messages_ct)
     loaded = __import__("json").loads(payload)
     assert loaded[0]["content"] == "hi"
+
+
+# ── New tests for C4 and H6 fixes ─────────────────────────────────────────────
+
+async def test_list_content_text_blocks_are_redacted(tmp_path: Path):
+    """C4: list-typed message content with 'text' dicts gets redacted."""
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    secret = "Bearer abc123def456ghi789"
+    list_content = [
+        {"type": "text", "text": f"result: {secret}"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+    ]
+    convo = _convo(messages=[ConvoMessage(role="user", content=list_content)])
+    async with ConvoStore(db_path) as store:
+        await store.save(convo)
+        loaded = await store.get_latest_for_intent("intent-A")
+
+    assert loaded is not None
+    content = loaded.messages[0].content
+    assert isinstance(content, list)
+    # The text block's "text" value must have been redacted.
+    assert "abc123def456ghi789" not in content[0]["text"]
+    assert "[REDACTED]" in content[0]["text"]
+    # Non-text blocks pass through unchanged.
+    assert content[1] == {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}}
+
+
+async def test_list_content_str_items_are_redacted(tmp_path: Path):
+    """C4: plain strings inside a list content are also redacted."""
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    secret = "Bearer abc123def456ghi789"
+    list_content = [f"token is {secret}", "plain safe string"]
+    convo = _convo(messages=[ConvoMessage(role="user", content=list_content)])
+    async with ConvoStore(db_path) as store:
+        await store.save(convo)
+        loaded = await store.get_latest_for_intent("intent-A")
+
+    assert loaded is not None
+    content = loaded.messages[0].content
+    assert isinstance(content, list)
+    assert "abc123def456ghi789" not in content[0]
+    assert "[REDACTED]" in content[0]
+    assert content[1] == "plain safe string"
+
+
+async def test_list_content_no_text_key_passes_through(tmp_path: Path):
+    """C4: dict items without a 'text' key are passed through unchanged."""
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    list_content = [{"type": "tool_use", "id": "call_abc", "name": "my_tool"}]
+    convo = _convo(messages=[ConvoMessage(role="assistant", content=list_content)])
+    async with ConvoStore(db_path) as store:
+        await store.save(convo)
+        loaded = await store.get_latest_for_intent("intent-A")
+
+    assert loaded is not None
+    assert loaded.messages[0].content == list_content
+
+
+async def test_get_latest_invalid_token_returns_none_with_warning(tmp_path: Path):
+    """H6: InvalidToken on get_latest_for_intent returns None and warns."""
+    import warnings as _warnings
+    from unittest.mock import patch
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    convo = _convo()
+    async with ConvoStore(db_path) as store:
+        await store.save(convo)
+
+    # Patch decrypt to simulate a key-rotation InvalidToken error.
+    from cryptography.fernet import InvalidToken as _IT
+
+    with patch("persistence.store.decrypt", side_effect=_IT("bad token")):
+        async with ConvoStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                result = await store.get_latest_for_intent("intent-A")
+
+    assert result is None
+    assert len(w) == 1
+    assert "corrupt" in str(w[0].message).lower() or "rotation" in str(w[0].message).lower()
+
+
+async def test_list_all_skips_undecryptable_rows_with_warning(tmp_path: Path):
+    """H6: InvalidToken in list_all skips the affected row and warns."""
+    import warnings as _warnings
+    from unittest.mock import patch
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    # Save two rows; capture the exact ciphertext of the first to identify it.
+    async with ConvoStore(db_path) as store:
+        await store.save(_convo(convo_id="ok-row", intent="intent-A"))
+        await store.save(_convo(convo_id="bad-row", intent="intent-B"))
+
+    # Read the raw ciphertext for "bad-row" so we can fail exactly that call.
+    import aiosqlite
+    async with aiosqlite.connect(db_path) as conn:
+        cur = await conn.execute(
+            "SELECT messages FROM convos WHERE id = ?", ("bad-row",)
+        )
+        bad_ct = (await cur.fetchone())[0]
+
+    from cryptography.fernet import InvalidToken as _IT
+    real_decrypt = decrypt
+
+    def targeted_fail(ct: str) -> str:
+        if ct == bad_ct:
+            raise _IT("simulated key rotation")
+        return real_decrypt(ct)
+
+    with patch("persistence.store.decrypt", side_effect=targeted_fail):
+        async with ConvoStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                results = await store.list_all()
+
+    # One row is skipped; the other is returned.
+    assert len(results) == 1
+    assert results[0].id == "ok-row"
+    assert any(
+        "corrupt" in str(wi.message).lower() or "rotation" in str(wi.message).lower()
+        for wi in w
+    )

@@ -231,3 +231,51 @@ async def test_on_response_handles_json_decode_error():
     assert len(drained) == 1
     assert drained[0].body == b"not json at all"
     assert drained[0].json is None
+
+
+# ── M11: json.loads(body) not response.json() ────────────────────────────────
+
+async def test_on_response_uses_body_bytes_for_json_not_response_json():
+    """M11 — _on_response calls json.loads(body) not response.json()."""
+    sniffer = PacketSniffer([r".*"])
+    body_bytes = b'{"key": "value"}'
+    response = _mock_response(body=body_bytes, json_body={"key": "value"})
+    await sniffer._on_response(response)
+
+    # response.json() (Playwright IPC call) must NOT have been called
+    response.json.assert_not_called()
+
+    drained = sniffer.drain()
+    assert len(drained) == 1
+    assert drained[0].json == {"key": "value"}
+    assert drained[0].body == body_bytes
+
+
+async def test_on_response_json_parse_catches_json_decode_error_not_all_exceptions():
+    """M11 — JSON parse failure uses json.JSONDecodeError, item still captured."""
+    sniffer = PacketSniffer([r".*"])
+    # binary body that is not valid JSON
+    response = _mock_response(body=b"\xff\xfe", json_raises=True)
+    await sniffer._on_response(response)
+
+    # response.json() must not be called — we use json.loads on the raw body
+    response.json.assert_not_called()
+
+    drained = sniffer.drain()
+    assert len(drained) == 1
+    assert drained[0].json is None
+
+
+async def test_on_response_valid_json_parsed_from_body_bytes():
+    """M11 — Valid JSON body bytes are parsed via json.loads."""
+    sniffer = PacketSniffer([r".*"])
+    payload = {"id": 42, "name": "test"}
+    body_bytes = json.dumps(payload).encode()
+    response = _mock_response(body=body_bytes, json_body=payload)
+    await sniffer._on_response(response)
+
+    # Must use body, not response.json()
+    response.json.assert_not_called()
+
+    drained = sniffer.drain()
+    assert drained[0].json == payload

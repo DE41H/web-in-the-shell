@@ -1,4 +1,5 @@
 import json
+import warnings
 from pathlib import Path
 
 import aiosqlite
@@ -9,9 +10,28 @@ from persistence.crypto import decrypt, encrypt
 from persistence.models import Convo, ConvoMessage
 
 
+def _redact_list_content(content: list) -> list:
+    """Redact sensitive tokens within a list-typed message content block."""
+    result = []
+    for item in content:
+        if isinstance(item, dict):
+            if isinstance(item.get("text"), str):
+                item = {**item, "text": redact(item["text"])}
+            result.append(item)
+        elif isinstance(item, str):
+            result.append(redact(item))
+        else:
+            result.append(item)
+    return result
+
+
 def _redact_message(message: ConvoMessage) -> ConvoMessage:
     if isinstance(message.content, str):
         return message.model_copy(update={"content": redact(message.content)})
+    if isinstance(message.content, list):
+        return message.model_copy(
+            update={"content": _redact_list_content(message.content)}
+        )
     return message
 
 
@@ -58,14 +78,22 @@ class ConvoStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        decrypted_row = (
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            decrypt(row[4]),
-            decrypt(row[5]) if row[5] else None,
-        )
+        try:
+            decrypted_row = (
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                decrypt(row[4]),
+                decrypt(row[5]) if row[5] else None,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"ConvoStore.get_latest_for_intent: failed to decrypt row for intent "
+                f"'{intent}': {exc}; returning None (key rotation or DB corruption).",
+                stacklevel=2,
+            )
+            return None
         return Convo.from_row(decrypted_row)
 
     async def save(self, convo: Convo) -> None:
@@ -112,14 +140,22 @@ class ConvoStore:
             rows = await cur.fetchall()
         out: list[Convo] = []
         for row in rows:
-            decrypted_row = (
-                row[0],
-                row[1],
-                row[2],
-                row[3],
-                decrypt(row[4]),
-                decrypt(row[5]) if row[5] else None,
-            )
+            try:
+                decrypted_row = (
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    decrypt(row[4]),
+                    decrypt(row[5]) if row[5] else None,
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"ConvoStore.list_all: failed to decrypt row id='{row[0]}': {exc}; "
+                    "skipping row (key rotation or DB corruption).",
+                    stacklevel=2,
+                )
+                continue
             out.append(Convo.from_row(decrypted_row))
         return out
 

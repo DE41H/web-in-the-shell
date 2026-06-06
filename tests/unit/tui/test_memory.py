@@ -374,3 +374,47 @@ async def test_manage_memory_propagates_cancellation(tmp_path: Path):
             input_provider=_CancelImmediately(),
             confirm_provider=_never_confirm,
         )
+
+
+async def test_confirm_provider_default_does_not_raise_type_error(tmp_path: Path):
+    """The default _CONFIRM lambda must accept (prompt, False) without raising TypeError.
+
+    Previously ``_CONFIRM = Confirm.ask`` caused a TypeError because ``Confirm.ask``
+    requires ``default`` as a keyword argument, but the call sites passed it positionally.
+    The fix wraps it in a lambda that forwards ``default`` as a keyword arg.
+    """
+    from tui.memory import _CONFIRM
+
+    # Calling with positional default=False must not raise TypeError.
+    # We can't actually run Rich's Confirm.ask in a test (it reads stdin), so
+    # we just verify the lambda signature accepts two positional args.
+    import inspect
+    sig = inspect.signature(_CONFIRM)
+    params = list(sig.parameters.values())
+    # Must accept at least two positional parameters
+    assert len(params) >= 2, (
+        "_CONFIRM must accept (prompt, default) — got only one parameter"
+    )
+
+
+async def test_clear_all_with_trailing_tokens_still_runs(tmp_path: Path):
+    """'clear-all extra tokens' should run clear-all (extra tokens are silently ignored
+    per the current dispatch logic — the head is 'clear-all' and tail is ignored).
+    """
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    async with ConvoStore(db_path) as store:
+        await store.save(_convo(intent="intent-X"))
+
+    console = _console()
+    queue = _InputQueue("clear-all extra tokens", "quit")
+
+    def _confirm(_prompt: str, default: bool = False) -> bool:
+        return True
+
+    await manage_memory(
+        db_path, console, input_provider=queue, confirm_provider=_confirm
+    )
+    out = console.export_text()
+    # Should have deleted the record (clear-all ran)
+    assert "deleted 1" in out

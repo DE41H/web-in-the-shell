@@ -61,15 +61,6 @@ def test_plan_default_steps_empty():
     assert plan.steps == []
 
 
-def test_plan_default_fallback_search_false():
-    plan = Plan(target_domain="x", target_endpoints=["a"], action="b", parameters={})
-    assert plan.fallback_search is False
-
-
-def test_plan_default_search_query_empty():
-    plan = Plan(target_domain="x", target_endpoints=["a"], action="b", parameters={})
-    assert plan.search_query == ""
-
 
 # ---- PlannerAgent.plan ----
 
@@ -158,7 +149,6 @@ async def test_plan_fallback_search_calls_handle_fallback():
     planner = _planner(side_effect=[first, second])
     planner._search_duckduckgo = AsyncMock(return_value="fake search results")
     plan = await planner.plan("Find a thing")
-    assert plan.fallback_search is False
     assert plan.target_domain == "https://app.example.com"
 
 
@@ -190,7 +180,6 @@ async def test_handle_fallback_returns_plan():
     plan = await planner.handle_fallback("find alice app")
     assert isinstance(plan, Plan)
     assert plan.target_domain == "https://app.example.com"
-    assert plan.fallback_search is False
 
 
 async def test_handle_fallback_no_tool_call_raises():
@@ -267,8 +256,15 @@ async def test_plan_without_convos_does_not_load_past(tmp_path: Path):
     await planner.plan("Create a user named Alice")
 
     assert planner.last_usage is not None
-    assert len(planner.last_messages) == 1
+    # H2: last_messages includes user intent + tool_use assistant + tool_result user
+    assert len(planner.last_messages) == 3
     assert planner.last_messages[0]["role"] == "user"
+    assert planner.last_messages[1]["role"] == "assistant"
+    assert isinstance(planner.last_messages[1]["content"], list)
+    assert planner.last_messages[1]["content"][0]["type"] == "tool_use"
+    assert planner.last_messages[2]["role"] == "user"
+    assert isinstance(planner.last_messages[2]["content"], list)
+    assert planner.last_messages[2]["content"][0]["type"] == "tool_result"
 
 
 async def test_plan_with_convos_prepends_past_messages(tmp_path: Path):
@@ -301,7 +297,9 @@ async def test_plan_with_convos_prepends_past_messages(tmp_path: Path):
         await planner.plan("Create a user named Alice")
 
     sent = client.chat.await_args.kwargs["messages"]
-    assert len(sent) == 3
+    # H2: sent is the same list mutated in-place after chat() (tool_use/result appended),
+    # so >= 3. The first 3 entries are the past messages + new intent.
+    assert len(sent) >= 3
     assert sent[0]["role"] == "user"
     assert sent[0]["content"] == "Create a user named Alice"
     assert sent[1]["role"] == "assistant"
@@ -337,7 +335,8 @@ async def test_plan_with_convos_no_match_does_not_prepend(tmp_path: Path):
         await planner.plan("Create a user named Alice")
 
     sent = client.chat.await_args.kwargs["messages"]
-    assert len(sent) == 1
+    # H2: sent is mutated in-place, so it has >= 1; only the first entry is the intent.
+    assert len(sent) >= 1
     assert sent[0]["role"] == "user"
 
 
@@ -360,12 +359,21 @@ async def test_plan_records_assistant_text_in_last_messages(tmp_path: Path):
     planner = PlannerAgent(client)
     await planner.plan("Create a user named Alice")
 
-    assert len(planner.last_messages) == 2
+    # H2: last_messages = [user intent, assistant text, assistant tool_use, user tool_result]
+    assert len(planner.last_messages) == 4
     assert planner.last_messages[0]["role"] == "user"
     assert planner.last_messages[1] == {
         "role": "assistant",
         "content": "I will create the user now.",
     }
+    # tool_use block is in [2]
+    assert planner.last_messages[2]["role"] == "assistant"
+    assert isinstance(planner.last_messages[2]["content"], list)
+    assert planner.last_messages[2]["content"][0]["type"] == "tool_use"
+    # tool_result block is in [3]
+    assert planner.last_messages[3]["role"] == "user"
+    assert isinstance(planner.last_messages[3]["content"], list)
+    assert planner.last_messages[3]["content"][0]["type"] == "tool_result"
 
 
 async def test_plan_with_no_assistant_text_records_only_user(tmp_path: Path):
@@ -381,8 +389,12 @@ async def test_plan_with_no_assistant_text_records_only_user(tmp_path: Path):
     planner = PlannerAgent(client)
     await planner.plan("Create a user named Alice")
 
+    # H2: [user intent, assistant tool_use, user tool_result]
+    assert len(planner.last_messages) == 3
+    assert planner.last_messages[0]["role"] == "user"
     assert planner.last_messages[-1]["role"] == "user"
-    assert len(planner.last_messages) == 1
+    assert isinstance(planner.last_messages[-1]["content"], list)
+    assert planner.last_messages[-1]["content"][0]["type"] == "tool_result"
 
 
 # ---- handle_fallback sets last_messages ----
@@ -542,4 +554,257 @@ async def test_handle_fallback_empty_endpoints_uses_empty_first_endpoint():
     plan = await planner.handle_fallback("find something")
     assert plan.target_domain == "https://example.com"
     assert plan.steps[0]["endpoint"] == ""
+
+
+# ── H1: handle_fallback appends to existing messages, doesn't replace ──────────
+
+async def test_handle_fallback_appends_to_primary_messages():
+    """H1: handle_fallback called from plan() should extend, not replace, last_messages."""
+    from ai.provider import LLMResponse, ToolCall
+
+    # First call: fallback_search
+    fallback_response = LLMResponse(
+        tool_calls=[ToolCall(name="fallback_search", input={"query": "alice app"})],
+        text="",
+        usage={"input": 5, "output": 5, "model": "test"},
+    )
+    # Second call (inside handle_fallback): route_to_domain
+    route_response = LLMResponse(
+        tool_calls=[ToolCall(
+            name="route_to_domain",
+            input={
+                "domain": "https://alice.app",
+                "endpoints": ["/api/users"],
+                "action": "create",
+                "parameters": {"name": "Alice"},
+            },
+        )],
+        text="",
+        usage={"input": 6, "output": 6, "model": "test"},
+    )
+    client = mock_llm_client(side_effect=[fallback_response, route_response])
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="results")
+    await planner.plan("find alice app")
+
+    # H1: last_messages should contain the original intent user message PLUS
+    # the fallback user message — not just the fallback messages alone.
+    roles = [m["role"] for m in planner.last_messages]
+    # At minimum: user intent (from plan), then fallback user turn, then fallback assistant
+    assert roles[0] == "user", "First message should be the original intent"
+    intent_msg = planner.last_messages[0]["content"]
+    assert "find alice app" in intent_msg or "Intent:" in intent_msg
+
+
+async def test_handle_fallback_called_directly_preserves_context():
+    """H1: direct call to handle_fallback with no messages arg creates fresh list."""
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    plan = await planner.handle_fallback("find items")
+    assert plan.target_domain == "https://example.com"
+    # last_messages should have at least the fallback user turn
+    assert len(planner.last_messages) >= 1
+    assert planner.last_messages[0]["role"] == "user"
+
+
+# ── H2: tool-call/result pairs appended to last_messages ──────────────────────
+
+async def test_plan_last_messages_contains_tool_use_blocks():
+    """H2: after plan(), last_messages includes tool_use + tool_result blocks."""
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/posts"],
+            "action": "create_post",
+            "parameters": {"title": "Hello"},
+        },
+    ))
+    await planner.plan("Create a post")
+
+    # Find tool_use block
+    tool_use_msgs = [
+        m for m in planner.last_messages
+        if m["role"] == "assistant"
+        and isinstance(m.get("content"), list)
+        and any(b.get("type") == "tool_use" for b in m["content"])
+    ]
+    assert len(tool_use_msgs) == 1, "Should have exactly one assistant tool_use message"
+    tool_use_block = tool_use_msgs[0]["content"][0]
+    assert tool_use_block["type"] == "tool_use"
+    assert tool_use_block["name"] == "route_to_domain"
+    assert "id" in tool_use_block
+
+    # Find tool_result block — should reference the same id
+    tool_result_msgs = [
+        m for m in planner.last_messages
+        if m["role"] == "user"
+        and isinstance(m.get("content"), list)
+        and any(b.get("type") == "tool_result" for b in m["content"])
+    ]
+    assert len(tool_result_msgs) == 1, "Should have exactly one user tool_result message"
+    tool_result_block = tool_result_msgs[0]["content"][0]
+    assert tool_result_block["type"] == "tool_result"
+    assert tool_result_block["tool_use_id"] == tool_use_block["id"]
+
+
+# ── H12: KeyError guard in handle_fallback ────────────────────────────────────
+
+async def test_handle_fallback_missing_key_raises_value_error():
+    """H12: malformed route_to_domain in handle_fallback raises ValueError, not KeyError."""
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            # "domain" intentionally missing
+            "endpoints": ["/api"],
+            "action": "do_thing",
+            "parameters": {},
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    with pytest.raises(ValueError, match="Malformed route_to_domain tool call in fallback"):
+        await planner.handle_fallback("find something")
+
+
+async def test_handle_fallback_missing_endpoints_raises_value_error():
+    """H12: route_to_domain without 'endpoints' in handle_fallback raises ValueError."""
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            # "endpoints" intentionally missing — will raise KeyError on inp["endpoints"]
+            "action": "do_thing",
+            "parameters": {},
+        },
+    ))
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    with pytest.raises(ValueError, match="Malformed route_to_domain tool call in fallback"):
+        await planner.handle_fallback("find something")
+
+
+# ── M1: context sanitization and empty-context label ─────────────────────────
+
+async def test_plan_sanitizes_context_before_llm():
+    """M1: context is passed through sanitize_for_llm before embedding in the prompt."""
+    from unittest.mock import patch as _patch
+
+    calls = []
+
+    def tracking_sanitize(text: str) -> str:
+        calls.append(text)
+        return text  # pass-through for the test
+
+    planner = _planner(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/posts"],
+            "action": "create",
+            "parameters": {},
+        },
+    ))
+    with _patch("ai.discovery.planner.sanitize_for_llm", side_effect=tracking_sanitize):
+        await planner.plan("Create a post", context="endpoint=/api/posts error=500")
+
+    # sanitize_for_llm must have been called with the context string
+    assert any("endpoint=/api/posts" in c for c in calls), (
+        f"sanitize_for_llm was not called with the context. Calls: {calls}"
+    )
+
+
+async def test_plan_empty_context_omits_label():
+    """M1: when context='', the prompt must not include 'Current state context:'."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/posts"],
+            "action": "create",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    await planner.plan("Create a post", context="")
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    # Find the intent user message (first one with "Intent:" prefix)
+    intent_msg = next(
+        m for m in sent_messages if m["role"] == "user" and "Intent:" in str(m.get("content", ""))
+    )
+    assert "Current state context:" not in intent_msg["content"]
+
+
+async def test_plan_nonempty_context_includes_label():
+    """M1: when context is non-empty, the prompt includes 'Current state context:'."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://api.example.com",
+            "endpoints": ["/posts"],
+            "action": "create",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    await planner.plan("Create a post", context="status=200 endpoint=/posts")
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    intent_msg = next(
+        m for m in sent_messages if m["role"] == "user" and "Intent:" in str(m.get("content", ""))
+    )
+    assert "Current state context:" in intent_msg["content"]
+    assert "status=200" in intent_msg["content"]
+
+
+# ── History capped at 20 messages ─────────────────────────────────────────────
+
+async def test_plan_caps_past_messages_at_20(tmp_path: Path):
+    """Replayed conversation history is capped to the last 20 messages (10 turns)."""
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    async with ConvoStore(db_path) as store:
+        # Create a past convo with 30 messages (15 turns)
+        msgs = [
+            ConvoMessage(role="user" if i % 2 == 0 else "assistant", content=f"msg-{i}")
+            for i in range(30)
+        ]
+        past = Convo(
+            id="old-long",
+            intent="Long conversation",
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            updated_at=datetime(2026, 1, 1, tzinfo=UTC),
+            messages=msgs,
+            result=None,
+        )
+        await store.save(past)
+
+        client = mock_llm_client(make_llm_tool_response(
+            "route_to_domain",
+            {
+                "domain": "https://api.example.com",
+                "endpoints": ["/posts"],
+                "action": "create",
+                "parameters": {},
+            },
+        ))
+        planner = PlannerAgent(client, convos=store)
+        await planner.plan("Long conversation")
+
+    sent = client.chat.await_args.kwargs["messages"]
+    # Only past[-20:] + 1 new intent = 21 messages sent to LLM at most
+    # (plus tool_use/result appended after, but those are irrelevant here)
+    # The first 20 entries of sent should be past messages, the 21st is the intent
+    past_in_sent = [
+        m for m in sent
+        if m["role"] in ("user", "assistant") and "msg-" in str(m.get("content", ""))
+    ]
+    assert len(past_in_sent) <= 20, f"Expected ≤ 20 past messages, got {len(past_in_sent)}"
 

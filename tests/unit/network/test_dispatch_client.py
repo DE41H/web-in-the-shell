@@ -362,3 +362,126 @@ async def test_patch_acquires_and_releases_semaphore(sample_session):
     ) as dc:
         await asyncio.gather(*[dc.patch("/x", {}) for _ in range(6)])
     assert max_seen == 2
+
+
+# ── delete() ─────────────────────────────────────────────────────────────────
+
+@respx.mock
+async def test_delete_request(sample_session):
+    """C3 — DispatchClient.delete() fires a DELETE HTTP method."""
+    route = respx.delete("https://api.example.com/posts/1").mock(
+        return_value=httpx.Response(204)
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        response = await dc.delete("/posts/1")
+    assert response.status_code == 204
+    assert route.called
+
+
+@respx.mock
+async def test_delete_includes_live_headers(sample_session):
+    """C3 — delete() injects Authorization header from live credentials."""
+    route = respx.delete("https://api.example.com/posts/1").mock(
+        return_value=httpx.Response(204)
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        await dc.delete("/posts/1")
+    sent = route.calls.last.request
+    assert sent.headers["Authorization"] == "Bearer test-token-xyz"
+
+
+@respx.mock
+async def test_delete_with_absolute_url_validates_host(sample_session):
+    """C3 — delete() rejects SSRF-blocked hosts."""
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        with pytest.raises(ValueError):
+            await dc.delete("http://localhost/x")
+
+
+# ── Cookie header is live (C2) ────────────────────────────────────────────────
+
+@respx.mock
+async def test_cookie_header_set_from_live_credentials(sample_session):
+    """C2 — Cookie header is assembled from live credentials at call time."""
+    route = respx.post("https://api.example.com/posts").mock(
+        return_value=httpx.Response(200)
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        await dc.post("/posts", {})
+
+    sent = route.calls.last.request
+    # Must be in Cookie: header, NOT baked into the httpx client cookie jar
+    cookie_header = sent.headers.get("cookie", "") or sent.headers.get("Cookie", "")
+    assert "session=abc123" in cookie_header
+
+
+@respx.mock
+async def test_cookie_header_reflects_updated_credentials(sample_session):
+    """C2 — Cookie header reflects credential changes made after client open."""
+    route = respx.post("https://api.example.com/posts").mock(
+        return_value=httpx.Response(200)
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        # Update cookies after client is already open
+        sample_session.credentials.cookies = {"session": "new-token-xyz"}
+        await dc.post("/posts", {})
+
+    sent = route.calls.last.request
+    cookie_header = sent.headers.get("cookie", "") or sent.headers.get("Cookie", "")
+    assert "new-token-xyz" in cookie_header
+    assert "abc123" not in cookie_header
+
+
+@respx.mock
+async def test_no_cookie_header_when_credentials_empty(sample_session):
+    """C2 — No Cookie header when credentials.cookies is empty."""
+    sample_session.credentials.cookies = {}
+    route = respx.post("https://api.example.com/posts").mock(
+        return_value=httpx.Response(200)
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        await dc.post("/posts", {})
+
+    sent = route.calls.last.request
+    assert "cookie" not in {k.lower() for k in sent.headers.keys()}
+
+
+# ── max_retries=2 default (M7) ────────────────────────────────────────────────
+
+@respx.mock
+async def test_default_max_retries_is_2(sample_session):
+    """M7 — Default max_retries is 2: 3 total calls (1 + 2 retries)."""
+    route = respx.post("https://api.example.com/posts").mock(
+        side_effect=[
+            httpx.Response(429, headers={"retry-after": "0.01"}),
+            httpx.Response(429, headers={"retry-after": "0.01"}),
+            httpx.Response(200),
+        ]
+    )
+    async with DispatchClient(sample_session, base_url="https://api.example.com") as dc:
+        response = await dc.post("/posts", {})
+    assert response.status_code == 200
+    assert route.call_count == 3
+
+
+# ── Retry-After: 0 triggers immediate retry (M7) ─────────────────────────────
+
+@respx.mock
+async def test_retry_after_zero_triggers_immediate_retry(sample_session):
+    """M7 — Retry-After: 0 means retry immediately, not exponential backoff."""
+    route = respx.post("https://api.example.com/posts").mock(
+        side_effect=[
+            httpx.Response(429, headers={"retry-after": "0"}),
+            httpx.Response(200),
+        ]
+    )
+    async with DispatchClient(
+        sample_session, base_url="https://api.example.com", max_retries=1
+    ) as dc:
+        start = time.monotonic()
+        response = await dc.post("/posts", {})
+        elapsed = time.monotonic() - start
+    assert response.status_code == 200
+    assert route.call_count == 2
+    # Must be fast — no 1-second exponential backoff
+    assert elapsed < 0.5

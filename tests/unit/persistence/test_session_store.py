@@ -258,6 +258,85 @@ async def test_session_store_list_all_decrypts_ciphertext(tmp_path: Path):
     assert by_host["b.example.com"].extra_headers == {"x": "bv"}
 
 
+# ── New tests for H6 and M13 fixes ───────────────────────────────────────────
+
+async def test_get_invalid_token_returns_none_with_warning(tmp_path: Path):
+    """H6: decrypt failure in get() returns None and emits a warning."""
+    import warnings as _warnings
+    from unittest.mock import patch
+    from cryptography.fernet import InvalidToken as _IT
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    creds = SessionCredentials(bearer_token="tok", csrf_token="csrf")
+    async with SessionStore(db_path) as store:
+        await store.save("h", creds)
+
+    with patch("persistence.session_store.decrypt", side_effect=_IT("bad")):
+        async with SessionStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                result = await store.get("h")
+
+    assert result is None
+    assert len(w) == 1
+    assert "corrupt" in str(w[0].message).lower() or "rotation" in str(w[0].message).lower()
+
+
+async def test_list_all_invalid_token_skips_row_with_warning(tmp_path: Path):
+    """H6: decrypt failure in list_all() skips affected row and warns."""
+    import warnings as _warnings
+    from unittest.mock import patch
+    from cryptography.fernet import InvalidToken as _IT
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    async with SessionStore(db_path) as store:
+        await store.save("good.example.com", SessionCredentials(bearer_token="good-tok"))
+        await store.save("bad.example.com", SessionCredentials(bearer_token="bad-tok"))
+
+    call_count = {"n": 0}
+    from persistence.crypto import decrypt as _real_decrypt
+
+    def sometimes_fail(ct: str) -> str:
+        call_count["n"] += 1
+        if call_count["n"] == 3:
+            raise _IT("simulated rotation")
+        return _real_decrypt(ct)
+
+    with patch("persistence.session_store.decrypt", side_effect=sometimes_fail):
+        async with SessionStore(db_path) as store:
+            with _warnings.catch_warnings(record=True) as w:
+                _warnings.simplefilter("always")
+                results = await store.list_all()
+
+    assert len(results) == 1
+    assert any(
+        "corrupt" in str(wi.message).lower() or "rotation" in str(wi.message).lower()
+        for wi in w
+    )
+
+
+async def test_saved_row_updated_at_is_utc_aware(tmp_path: Path):
+    """M13: updated_at stored in sessions table is UTC-aware ISO timestamp."""
+    from datetime import UTC
+
+    db_path = tmp_path / "wits.db"
+    await init_db(db_path)
+    async with SessionStore(db_path) as store:
+        await store.save("h", SessionCredentials(bearer_token="tok"))
+        sessions = await store.list_all()
+
+    assert len(sessions) == 1
+    _, _, updated_at = sessions[0]
+    # Must be timezone-aware and in UTC.
+    assert updated_at.tzinfo is not None
+    assert (
+        updated_at.tzinfo == UTC
+        or updated_at.utcoffset().total_seconds() == 0  # type: ignore[union-attr]
+    )
+
+
 # ---- helpers ----
 
 async def asyncio_sleep(_store) -> None:

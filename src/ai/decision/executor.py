@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import re
+import sys
 from collections import deque
 
 from dataclasses import dataclass
@@ -47,6 +50,7 @@ class ExecutionAgent:
         self._recovery = RecoveryAgent(recovery_client)
         self.state_history: deque[CompactStateModel] = deque(maxlen=10)
         self.last_usage: dict | None = None
+        self.total_usage: dict = {}
 
     async def execute(
         self,
@@ -57,8 +61,10 @@ class ExecutionAgent:
         method: str = "POST",
     ) -> ExecutionResult:
         context = state.to_llm_context() if state else ""
-        # GET requests never send a body — skip the LLM refinement call entirely
-        if method.upper() == "GET":
+        m = method.upper()
+        # GET requests never send a body — skip the LLM refinement call entirely.
+        # Also skip when parameters is empty — no need to ask the LLM to refine nothing.
+        if m == "GET" or not parameters:
             payload = parameters
         else:
             payload = await self._refine_payload(action, endpoint, parameters, context)
@@ -66,13 +72,14 @@ class ExecutionAgent:
 
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
-                m = method.upper()
                 if m == "GET":
                     response = await self._dispatch.get(endpoint)
                 elif m == "PUT":
                     response = await self._dispatch.put(endpoint, payload)
                 elif m == "PATCH":
                     response = await self._dispatch.patch(endpoint, payload)
+                elif m == "DELETE":
+                    response = await self._dispatch.delete(endpoint)
                 else:
                     response = await self._dispatch.post(endpoint, payload)
             except Exception as exc:
@@ -99,7 +106,9 @@ class ExecutionAgent:
             if attempt == _MAX_RETRIES:
                 break
 
-            recovery = await self._recovery.handle(response, payload, action)
+            recovery = await self._recovery.handle(
+                response, payload, action, attempt_number=attempt - 1
+            )
 
             if not recovery.retry or recovery.abort_reason:
                 return ExecutionResult(
@@ -111,7 +120,9 @@ class ExecutionAgent:
 
             payload = recovery.revised_parameters
 
-            if response.status_code == 429 or response.status_code >= 500:
+            # M3: 429 is handled by DispatchClient's token bucket and retry logic;
+            # only sleep here for 5xx errors to avoid compounding delays.
+            if response.status_code >= 500:
                 await asyncio.sleep(min(2 ** attempt, 16))
 
         return ExecutionResult(
@@ -154,7 +165,8 @@ class ExecutionAgent:
             ]
 
         results: list[ExecutionResult] = []
-        for step in steps:
+        self.total_usage = {}
+        for step_num, step in enumerate(steps, start=1):
             current_state = self.state_history[-1] if self.state_history else None
             result = await self.execute(
                 action=step["action"],
@@ -164,6 +176,17 @@ class ExecutionAgent:
                 method=step.get("method", "POST"),
             )
             results.append(result)
+
+            # M14: accumulate per-step LLM usage into total_usage
+            if self.last_usage:
+                step_usage = self.last_usage
+                for key, val in step_usage.items():
+                    if isinstance(val, int):
+                        self.total_usage[key] = self.total_usage.get(key, 0) + val
+                    else:
+                        self.total_usage.setdefault(key, val)
+                self._log_step_cost(step_num, step_usage)
+
             if result.success and result.response_body is not None:
                 payload = (
                     result.response_body
@@ -183,6 +206,16 @@ class ExecutionAgent:
                 break
 
         return results
+
+    def _log_step_cost(self, step_num: int, usage: dict) -> None:
+        """Log per-step token cost to stderr for operator visibility."""
+        inp = usage.get("input", 0)
+        out = usage.get("output", 0)
+        model = usage.get("model", "unknown")
+        print(
+            f"[executor] step {step_num}: {inp} in / {out} out tokens ({model})",
+            file=sys.stderr,
+        )
 
     async def _refine_payload(
         self,

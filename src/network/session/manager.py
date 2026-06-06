@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Page, Request
+
+if TYPE_CHECKING:
+    from persistence.session_store import SessionStore
 
 
 _BEARER_RE = re.compile(r"Bearer\s+([A-Za-z0-9\-._~+/]+=*)", re.IGNORECASE)
@@ -52,6 +58,7 @@ class SessionManager:
         for name, value in headers.items():
             if name.lower() in _CSRF_HEADERS:
                 self.credentials.csrf_token = value
+                break
 
         # Playwright normalises all request-header keys to lowercase before
         # handing them to this callback, so a plain `key in headers` lookup is
@@ -67,7 +74,7 @@ class SessionManager:
         raw = await page.context.cookies()
         self.credentials.cookies = {c["name"]: c["value"] for c in raw}
 
-    async def restore(self, host: str, store) -> bool:
+    async def restore(self, host: str, store: SessionStore) -> bool:
         """Prime ``self.credentials`` from *store* for *host*. Returns ``True``
         if a row was loaded. Live values are preferred: stored values only
         fill fields that are currently empty.
@@ -82,11 +89,22 @@ class SessionManager:
         if creds.csrf_token and not self.credentials.csrf_token:
             self.credentials.csrf_token = creds.csrf_token
         if creds.extra_headers:
-            merged = dict(self.credentials.extra_headers)
-            merged.update(creds.extra_headers)
+            merged = dict(creds.extra_headers)      # start with stored
+            merged.update(self.credentials.extra_headers)  # live overwrites stored
             self.credentials.extra_headers = merged
         return True
 
-    async def persist(self, host: str, store) -> None:
-        """Mirror the current credentials to *store* for *host*."""
+    @property
+    def has_material(self) -> bool:
+        """Return True if any credential field has material value."""
+        c = self.credentials
+        return bool(c.bearer_token or c.csrf_token or c.cookies or c.extra_headers)
+
+    async def persist(self, host: str, store: SessionStore) -> None:
+        """Mirror the current credentials to *store* for *host*.
+
+        No-op when no credential field has material (avoids writing empty rows).
+        """
+        if not self.has_material:
+            return
         await store.save(host, self.credentials)

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -31,8 +32,8 @@ class PacketSniffer:
         try:
             body = await response.body()
             try:
-                json_body = await response.json()
-            except Exception:
+                json_body = json.loads(body)
+            except json.JSONDecodeError:
                 json_body = None
             captured = CapturedResponse(
                 url=response.url,

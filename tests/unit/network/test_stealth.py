@@ -187,10 +187,10 @@ async def test_login_handshake_before_launch_raises():
 
 
 @patch("network.security.stealth._stealth")
-@patch("network.security.stealth.asyncio.get_event_loop")
+@patch("network.security.stealth.asyncio.get_running_loop")
 @patch("network.security.stealth.async_playwright")
 async def test_login_handshake_launches_visible_browser(
-    mock_async_playwright, mock_get_event_loop, mock_stealth
+    mock_async_playwright, mock_get_running_loop, mock_stealth
 ):
     pw_instance, browser, context, _ = _make_playwright_stack()
 
@@ -207,7 +207,7 @@ async def test_login_handshake_launches_visible_browser(
 
     mock_loop = MagicMock()
     mock_loop.run_in_executor = AsyncMock(return_value=None)
-    mock_get_event_loop.return_value = mock_loop
+    mock_get_running_loop.return_value = mock_loop
 
     mock_stealth.apply_stealth_async = AsyncMock()
 
@@ -221,3 +221,30 @@ async def test_login_handshake_launches_visible_browser(
     assert launch_calls[1].kwargs["headless"] is False
     login_page.goto.assert_awaited_once_with("https://example.com/login")
     mock_stealth.apply_stealth_async.assert_any_await(login_page)
+
+
+@patch("network.security.stealth._stealth")
+@patch("network.security.stealth.asyncio.get_running_loop")
+@patch("network.security.stealth.async_playwright")
+async def test_login_handshake_closes_browser_on_exception(
+    mock_async_playwright, mock_get_running_loop, mock_stealth
+):
+    """H7 — login_handshake closes login_browser if an exception occurs."""
+    pw_instance, browser, context, _ = _make_playwright_stack()
+
+    login_browser = AsyncMock()
+    login_browser.close = AsyncMock()
+    # new_context raises to simulate failure mid-handshake
+    login_browser.new_context = AsyncMock(side_effect=RuntimeError("context failed"))
+
+    pw_instance.chromium.launch = AsyncMock(side_effect=[browser, login_browser])
+    _patched_async_playwright(mock_async_playwright, pw_instance)
+    mock_stealth.apply_stealth_async = AsyncMock()
+
+    sb = StealthBrowser()
+    await sb.__aenter__()
+    with pytest.raises(RuntimeError, match="context failed"):
+        await sb.login_handshake("https://example.com/login")
+
+    # login_browser must have been closed even though it raised
+    login_browser.close.assert_awaited_once()

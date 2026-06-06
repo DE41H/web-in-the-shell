@@ -15,9 +15,9 @@ uv run playwright install chromium  # one-time browser binary
 uv run src/main.py                  # live mode — interactive setup, then TUI
 uv run src/main.py --mock           # mock mode — no API key, hardcoded 2-step plan
 uv run src/main.py --no-interactive \
-    --target URL --intent TEXT \
+    --intent TEXT \
     [--provider NAME --api-key KEY --model NAME --recovery-model NAME] \
-    [--nav PATH --patterns REGEX...] [--replan N] [--login]
+    [--replan N] [--login]
                                     # fully scripted run; no prompts
 
 uv run src/main.py --memory list             # list stored conversations
@@ -28,11 +28,12 @@ uv run pytest                       # full test suite
 uv run pytest -m "not integration"  # unit tests only (fast, no browser)
 ```
 
-Every session setting (provider, API key, target URL, intent, model,
-nav path, replan count, login handshake) accepts a CLI flag. Any field
-not supplied via a flag is prompted for in the terminal before the Rich
-TUI launches; `--no-interactive` skips the prompts and fails fast on a
-missing required field. `--mock` and `--memory ...` need no API key.
+Every session setting (provider, API key, intent, model, replan count,
+login handshake) accepts a CLI flag. The target URL and nav path are
+AI-determined from the intent at runtime. Any field not supplied via a
+flag is prompted for in the terminal before the Rich TUI launches;
+`--no-interactive` skips the prompts and fails fast on a missing required
+field. `--mock` and `--memory ...` need no API key.
 
 ## Architecture
 
@@ -149,11 +150,13 @@ with cross-process memory.
 
 - **Why:** MVP had prompts for every field; CI/scripts could not
   drive it without a TTY. Every setting needs a CLI flag.
-- **What:** Added `--target`, `--intent`, `--nav`, `--patterns`,
-  `--replan`, `--provider`, `--api-key`, `--model`,
-  `--recovery-model`, `--login`, `--no-interactive` flags. Added
-  `--memory list|clear|clear-all` subcommand. `SessionConfig` is the
-  single source of truth; `_apply_args_to_config` does the wiring.
+- **What:** Added `--intent`, `--replan`, `--provider`, `--api-key`,
+  `--model`, `--recovery-model`, `--login`, `--no-interactive`,
+  `--mock` flags. Added `--memory list|clear|clear-all` subcommand.
+  `SessionConfig` is the single source of truth;
+  `_apply_args_to_config` does the wiring. Note: `--target`, `--nav`,
+  and `--patterns` were considered but not implemented — the target
+  URL and nav paths are AI-determined from the intent at runtime.
 - **Files:** `main.py`, `README.md`, `CLAUDE.md`, `AGENTS.md`.
 - **Verify:** `uv run src/main.py --help`.
 

@@ -82,32 +82,36 @@ class StealthBrowser:
                 "--disable-setuid-sandbox",
             ],
         )
-        login_context = await login_browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            bypass_csp=True,
-        )
-        page = await login_context.new_page()
-        await _stealth.apply_stealth_async(page)
-        await page.goto(url)
+        try:
+            login_context = await login_browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
+                bypass_csp=True,
+            )
+            page = await login_context.new_page()
+            await _stealth.apply_stealth_async(page)
+            await page.goto(url)
 
-        print(
-            f"[login] Navigate to {url} in the browser window, "
-            "complete login, then press Enter here...",
-            file=sys.stderr,
-            flush=True,
-        )
+            print(
+                f"[login] Navigate to {url} in the browser window, "
+                "complete login, then press Enter here...",
+                file=sys.stderr,
+                flush=True,
+            )
 
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, input)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, input)
 
-        # Trigger a cookie snapshot so callers can inspect session state
-        # immediately after the handshake if needed. The actual cookies live on
-        # the context and are accessible via page.context.cookies().
-        await page.context.cookies()
+            # Trigger a cookie snapshot so callers can inspect session state
+            # immediately after the handshake if needed. The actual cookies live on
+            # the context and are accessible via page.context.cookies().
+            await page.context.cookies()
 
-        return page
+            return page
+        except Exception:
+            await login_browser.close()
+            raise

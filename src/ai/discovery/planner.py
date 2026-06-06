@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+import json
+import uuid
 import httpx
 from dataclasses import dataclass, field
 
@@ -36,8 +40,6 @@ class Plan:
     target_endpoints: list[str]
     action: str
     parameters: dict
-    fallback_search: bool = False
-    search_query: str = ""
     # Multi-step support: each step is {"action": str, "endpoint": str, "parameters": dict}
     # The top-level action/target_endpoints[0]/parameters represent the first step for
     # backward compatibility with main.py.
@@ -175,19 +177,20 @@ class PlannerAgent:
 
     async def plan(self, user_intent: str, context: str = "") -> Plan:
         safe_intent = sanitize_for_llm(user_intent)
+        safe_context = sanitize_for_llm(context) if context else ""
         messages: list[dict] = []
 
         if self._convos is not None:
             past = await self._convos.get_latest_for_intent(safe_intent)
             if past is not None:
-                messages.extend(past.to_llm_messages())
+                # Cap replayed conversation history to the last 20 messages (10 turns)
+                messages.extend(past.to_llm_messages()[-20:])
 
-        messages.append(
-            {
-                "role": "user",
-                "content": f"Intent: {safe_intent}\n\nCurrent state context:\n{context}".strip(),
-            }
-        )
+        # M1: only include context label when context is non-empty
+        content = f"Intent: {safe_intent}"
+        if safe_context:
+            content += f"\n\nCurrent state context:\n{safe_context}"
+        messages.append({"role": "user", "content": content})
 
         resp = await self._client.chat(
             system=_SYSTEM,
@@ -199,6 +202,29 @@ class PlannerAgent:
 
         if resp.text:
             messages.append({"role": "assistant", "content": resp.text})
+
+        # H2: append tool-call/tool-result pairs BEFORE saving last_messages
+        if resp.tool_calls:
+            tool_use_content = [
+                {
+                    "type": "tool_use",
+                    "id": tc.id or str(uuid.uuid4()),
+                    "name": tc.name,
+                    "input": tc.input,
+                }
+                for tc in resp.tool_calls
+            ]
+            messages.append({"role": "assistant", "content": tool_use_content})
+
+            tool_result_content = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_content[i]["id"],
+                    "content": json.dumps(tc.input),
+                }
+                for i, tc in enumerate(resp.tool_calls)
+            ]
+            messages.append({"role": "user", "content": tool_result_content})
 
         self.last_messages = list(messages)
 
@@ -245,7 +271,7 @@ class PlannerAgent:
                     raise ValueError(f"Malformed plan_steps tool call — missing key {e}") from e
 
             if call.name == "fallback_search":
-                return await self.handle_fallback(call.input["query"])
+                return await self.handle_fallback(call.input["query"], messages=messages)
 
         raise ValueError(f"Planner produced no actionable tool call. Response: {resp}")
 
@@ -265,11 +291,14 @@ class PlannerAgent:
                 parts.append(topic["Text"])
         return "\n".join(parts)[:1500]
 
-    async def handle_fallback(self, query: str) -> Plan:
+    async def handle_fallback(self, query: str, *, messages: list[dict] | None = None) -> Plan:
         """
         Performs a real DuckDuckGo search for the query, then uses an LLM call
         to discover the most likely domain + API endpoint structure and return
         a concrete Plan.
+
+        H1: receives the primary call's message list and APPENDS to it rather
+        than replacing it, so full conversation history is preserved.
         """
         search_results = await self._search_duckduckgo(query)
 
@@ -281,7 +310,11 @@ class PlannerAgent:
             "and API endpoints needed to fulfil the intent. Call route_to_domain."
         )
 
-        messages = [{"role": "user", "content": content}]
+        # H1: extend the existing message list rather than starting fresh
+        if messages is None:
+            messages = []
+        messages.append({"role": "user", "content": content})
+
         resp = await self._client.chat(
             system=_FALLBACK_SYSTEM,
             messages=messages,
@@ -289,32 +322,38 @@ class PlannerAgent:
             max_tokens=512,
         )
         self.last_usage = resp.usage
-        self.last_messages = list(messages)
+
         if resp.text:
-            self.last_messages.append({"role": "assistant", "content": resp.text})
+            messages.append({"role": "assistant", "content": resp.text})
+
+        self.last_messages = list(messages)
 
         for call in resp.tool_calls:
             if call.name != "route_to_domain":
                 continue
 
             inp = call.input
-            first_endpoint = inp["endpoints"][0] if inp["endpoints"] else ""
-            steps = [
-                {
-                    "action": inp["action"],
-                    "endpoint": first_endpoint,
-                    "parameters": inp["parameters"],
-                    "method": inp.get("method", "POST"),
-                }
-            ]
-            return Plan(
-                target_domain=inp["domain"],
-                target_endpoints=inp["endpoints"],
-                action=inp["action"],
-                parameters=inp["parameters"],
-                fallback_search=False,
-                steps=steps,
-            )
+            try:
+                first_endpoint = inp["endpoints"][0] if inp["endpoints"] else ""
+                steps = [
+                    {
+                        "action": inp["action"],
+                        "endpoint": first_endpoint,
+                        "parameters": inp["parameters"],
+                        "method": inp.get("method", "POST"),
+                    }
+                ]
+                return Plan(
+                    target_domain=inp["domain"],
+                    target_endpoints=inp["endpoints"],
+                    action=inp["action"],
+                    parameters=inp["parameters"],
+                    steps=steps,
+                )
+            except KeyError as e:
+                raise ValueError(
+                    f"Malformed route_to_domain tool call in fallback — missing key {e}"
+                ) from e
 
         raise ValueError(
             f"Fallback planner produced no route_to_domain tool call. Response: {resp}"

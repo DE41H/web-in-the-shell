@@ -355,8 +355,8 @@ async def test_execute_plan_defaults_to_post_when_method_absent():
 
 # ── Exponential backoff ───────────────────────────────────────────────────────
 
-async def test_execute_backoff_called_on_429(monkeypatch):
-    """asyncio.sleep is awaited with a positive delay when status is 429."""
+async def test_execute_no_backoff_on_429(monkeypatch):
+    """M3: 429 is handled by DispatchClient internally; executor must NOT sleep on 429."""
     import asyncio as _aio
     slept = []
     async def fake_sleep(n):
@@ -375,9 +375,12 @@ async def test_execute_backoff_called_on_429(monkeypatch):
     agent = ExecutionAgent(dispatch, exec_client, rec_client)
     result = await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
     assert result.success is True
-    assert any(s > 0 for s in slept), "Expected at least one sleep call"
+    # Executor must NOT sleep for 429 — that is DispatchClient's responsibility
+    assert slept == [], f"Executor should not sleep on 429, but slept: {slept}"
+
 
 async def test_execute_backoff_called_on_503(monkeypatch):
+    """5xx errors (but not 429) should trigger executor-level backoff sleep."""
     import asyncio as _aio
     slept = []
     async def fake_sleep(n):
@@ -424,3 +427,101 @@ async def test_execute_post_still_calls_llm_refinement():
     agent = ExecutionAgent(dispatch, exec_client, rec_client)
     await agent.execute(action="create", endpoint="/posts", parameters={"title": "orig"})
     exec_client.chat.assert_awaited_once()
+
+
+# ── C3: DELETE method dispatched correctly ────────────────────────────────────
+
+async def test_execute_delete_method_calls_dispatch_delete():
+    """C3: method='DELETE' routes to dispatch.delete(), not post()."""
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    dispatch.delete = AsyncMock(return_value=_ok_response())
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="delete", endpoint="/posts/1", parameters={}, method="DELETE"
+    )
+    assert result.success is True
+    dispatch.delete.assert_awaited_once_with("/posts/1")
+    dispatch.post.assert_not_awaited()
+
+
+async def test_execute_delete_lowercase_calls_dispatch_delete():
+    """C3: method='delete' (lowercase) also routes to dispatch.delete()."""
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    dispatch.delete = AsyncMock(return_value=_ok_response())
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="delete", endpoint="/posts/1", parameters={}, method="delete"
+    )
+    assert result.success is True
+    dispatch.delete.assert_awaited_once_with("/posts/1")
+
+
+# ── Empty params: skip _refine_payload ───────────────────────────────────────
+
+async def test_execute_empty_params_skips_llm_refinement():
+    """Token reduction: when parameters={}, _refine_payload must not be called."""
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(action="create", endpoint="/posts", parameters={}, method="POST")
+    assert result.success is True
+    exec_client.chat.assert_not_awaited()
+
+
+async def test_execute_non_empty_params_still_calls_refinement():
+    """Regression guard: non-empty params for POST still calls _refine_payload."""
+    dispatch, exec_client, rec_client = _build('```json\n{"title": "refined"}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(action="create", endpoint="/posts", parameters={"title": "x"})
+    assert result.success is True
+    exec_client.chat.assert_awaited_once()
+
+
+# ── M14: total_usage accumulates across steps ─────────────────────────────────
+
+async def test_execute_plan_total_usage_accumulates():
+    """M14: total_usage sums input/output token counts from each step's LLM call."""
+    from ai.discovery.planner import Plan
+
+    dispatch, exec_client, rec_client = _build('```json\n{"x": 1}\n```')
+    # Give the exec_client a fixed usage return each call
+    from ai.provider import LLMResponse
+    exec_client.chat = AsyncMock(return_value=LLMResponse(
+        tool_calls=[],
+        text='```json\n{"x": 1}\n```',
+        usage={"input": 10, "output": 5, "model": "test"},
+    ))
+    plan = Plan(
+        target_domain="https://example.com",
+        target_endpoints=["/x", "/y"],
+        action="create",
+        parameters={"x": 1},
+        steps=[
+            {"action": "create", "endpoint": "/x", "parameters": {"a": 1}},
+            {"action": "update", "endpoint": "/y", "parameters": {"b": 2}},
+        ],
+    )
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    results = await agent.execute_plan(plan)
+    assert len(results) == 2
+    # Each step calls _refine_payload once, using 10 in + 5 out
+    assert agent.total_usage.get("input") == 20
+    assert agent.total_usage.get("output") == 10
+
+
+async def test_execute_plan_total_usage_empty_when_no_llm_calls():
+    """M14: when all steps are GET (no LLM refinement), total_usage remains empty."""
+    from ai.discovery.planner import Plan
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    dispatch.get = AsyncMock(return_value=_ok_response({"posts": []}))
+    plan = Plan(
+        target_domain="https://example.com",
+        target_endpoints=["/posts"],
+        action="list",
+        parameters={},
+        steps=[{"action": "list", "endpoint": "/posts", "parameters": {}, "method": "GET"}],
+    )
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute_plan(plan)
+    # last_usage is None since _refine_payload was never called
+    assert agent.last_usage is None
+    assert agent.total_usage == {}

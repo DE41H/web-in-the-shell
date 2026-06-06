@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import json
 import re
 
 import httpx
 from dataclasses import dataclass
 
+from security.sanitize import sanitize_for_llm
 from ai.provider import LLMClient
 
 
@@ -40,15 +43,19 @@ class RecoveryAgent:
         failed_response: httpx.Response,
         original_parameters: dict,
         action: str,
+        attempt_number: int = 0,
     ) -> RecoveryResult:
         try:
-            error_body = failed_response.text[:800]
+            error_body = sanitize_for_llm(failed_response.text[:800])
         except Exception:
             error_body = "(response body unreadable)"
 
+        safe_params = sanitize_for_llm(json.dumps(original_parameters))
+
         prompt = (
+            f"Attempt: {attempt_number + 1}\n"
             f"HTTP {failed_response.status_code} on action: '{action}'\n"
-            f"Original parameters: {json.dumps(original_parameters)}\n"
+            f"Original parameters: {safe_params}\n"
             f"Error body:\n{error_body}"
         )
 

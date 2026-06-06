@@ -17,6 +17,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, UTC
+from urllib.parse import urlparse
 
 import httpx
 from rich.console import Console
@@ -31,6 +32,7 @@ from network.session.manager import SessionManager
 from network.dispatch.client import DispatchClient
 from serialization.models import compact_from_capture, CompactStateModel
 from security.sanitize import sanitize_for_llm
+from security.allowlist import validate_url
 from ai.provider import (
     LLMClient,
     DEFAULT_MODELS,
@@ -46,6 +48,7 @@ from persistence import (
     Convo,
     ConvoMessage,
     FormFieldStore,
+    SessionStore,
     init_db,
 )
 from tui.display import AgentDisplay
@@ -91,7 +94,7 @@ def _handle_api_error(exc: Exception, display: "AgentDisplay") -> None:
         or "quota" in msg.lower()
     ):
         display.set_status("Failed")
-        display.log_thought("[bold red]API quota / rate-limit error[/bold red]")
+        display.log_thought("API quota / rate-limit error")
         display.log_thought(msg.split("\n")[0][:200])
     elif (
         isinstance(exc, (_ant_auth, _oai_auth))
@@ -100,11 +103,11 @@ def _handle_api_error(exc: Exception, display: "AgentDisplay") -> None:
         or "invalid_api_key" in msg.lower()
     ):
         display.set_status("Failed")
-        display.log_thought("[bold red]API authentication error — check your key[/bold red]")
+        display.log_thought("API authentication error — check your key")
     elif isinstance(exc, asyncio.TimeoutError) or "timed out" in msg.lower():
         display.set_status("Failed")
         display.log_thought(
-            "[bold red]Request timed out — provider may be slow or unreachable[/bold red]"
+            "Request timed out — provider may be slow or unreachable"
         )
     elif (
         isinstance(exc, (httpx.ConnectError, httpx.NetworkError))
@@ -113,11 +116,11 @@ def _handle_api_error(exc: Exception, display: "AgentDisplay") -> None:
         or "connect" in name.lower()
     ):
         display.set_status("Failed")
-        display.log_thought("[bold red]No network connection[/bold red]")
+        display.log_thought("No network connection")
         display.log_thought("Check your internet and try again. This app requires connectivity.")
     else:
         display.set_status("Failed")
-        display.log_thought(f"[bold red]{name}[/bold red]: {msg[:200]}")
+        display.log_thought(f"{name}: {msg[:200]}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +316,8 @@ async def _build_config_async(
     parser: argparse.ArgumentParser,
 ) -> SessionConfig:
     if args.mock:
+        if args.no_interactive and not args.intent:
+            parser.error("--mock --no-interactive requires --intent TEXT")
         config = SessionConfig(mock=True, no_interactive=args.no_interactive)
         _apply_args_to_config(args, config)
         return config
@@ -503,6 +508,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
     async with (
         ConvoStore(DEFAULT_DB_PATH) as convos,
         FormFieldStore(DEFAULT_DB_PATH) as form_store,
+        SessionStore(DEFAULT_DB_PATH) as session_store,
     ):
         last_planner: PlannerAgent | None = None
 
@@ -516,7 +522,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                 plan = await planner.plan(safe_intent)
             except Exception as exc:
                 display.set_status("Failed")
-                display.log_thought(f"[bold red]Planning failed:[/bold red] {exc}")
+                display.log_thought(f"Planning failed: {exc}")
                 return
             last_planner = planner
             if planner.last_usage:
@@ -563,16 +569,23 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         f"↙ {cap.url[-48:]}  {cap.raw_size:,}b→{state.compact_size}b  ({pct}%↓)"
                     )
 
+            host = urlparse(target).hostname or ""
             display.log_thought(f"Navigating → {nav_url}")
+            try:
+                validate_url(nav_url)
+            except ValueError as exc:
+                display.log_thought(f"Blocked navigation to unsafe URL: {exc}")
+                return
             stream_task = asyncio.create_task(_collect_stream())
             nav_ok = True
             try:
                 await page.goto(nav_url, wait_until="networkidle", timeout=30_000)
                 await session.sync_cookies(page)
+                await session.restore(host, session_store)
             except Exception:
                 nav_ok = False
                 display.set_status("Failed")
-                display.log_thought(f"[bold red]Cannot reach {nav_url}[/bold red]")
+                display.log_thought(f"Cannot reach {nav_url}")
                 display.log_thought("Check your internet connection and the target URL.")
             finally:
                 stream_task.cancel()
@@ -721,6 +734,9 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         await convos.save(convo)
                         display.log_thought("Saved conversation memory.")
 
+                if overall_success:
+                    await session.persist(host, session_store)
+
                 display.set_status("Complete" if overall_success else "Failed")
 
     display.log_thought("─" * 60)
@@ -810,14 +826,18 @@ async def _handle_command(raw: str, config: SessionConfig) -> bool:
             choice = IntPrompt.ask("  Choice", default=1)
             name = providers[max(1, min(choice, len(providers))) - 1]
 
+        prev_provider, prev_model, prev_api_key = config.provider, config.model, config.api_key
         config.provider = name
         config.model    = None
         config.api_key  = ""
 
         if name == "ollama":
             if not await _check_ollama():
+                config.provider = prev_provider
+                config.model = prev_model
+                config.api_key = prev_api_key
                 _console.print(
-                    "  [bold red]Ollama not found — start with `ollama serve`[/bold red]"
+                    "  Ollama not found — start with `ollama serve`. Reverted to previous provider."
                 )
                 return True
             config.api_key = "ollama"

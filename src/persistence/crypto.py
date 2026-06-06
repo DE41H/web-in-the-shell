@@ -17,6 +17,7 @@ revert to plaintext.
 from __future__ import annotations
 
 import re
+import threading
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -27,6 +28,17 @@ _KEY_USERNAME = "wits-fernet-key-v1"
 _CIPHERTEXT_PREFIX = "enc:v1:"
 
 _KEY_B64_PATTERN = re.compile(r"[A-Za-z0-9_\-]{43}=")
+
+# Module-level key cache — loaded once per process lifetime.
+_KEY_CACHE: bytes | None = None
+_CACHE_LOCK = threading.Lock()
+
+
+def clear_key_cache() -> None:
+    """Invalidate the in-process key cache (for tests and key rotation)."""
+    global _KEY_CACHE
+    with _CACHE_LOCK:
+        _KEY_CACHE = None
 
 
 def _is_valid_b64_key(s: str | None) -> bool:
@@ -57,6 +69,15 @@ def _load_or_create_file_key() -> bytes:
         content = fallback.read_text(encoding="utf-8").strip()
         if _is_valid_b64_key(content):
             return content.encode("ascii")
+        # File exists but content is not a valid Fernet key — refuse to
+        # overwrite silently, because doing so would permanently destroy all
+        # data encrypted with the old key.
+        raise RuntimeError(
+            f"Fernet key file '{fallback}' appears corrupt (invalid base64 key). "
+            "Either restore the correct key or delete the file manually so a new "
+            "key can be generated. Do NOT delete the file if you have encrypted "
+            "data you still need to access."
+        )
 
     b64_key = Fernet.generate_key()
     try:
@@ -67,19 +88,39 @@ def _load_or_create_file_key() -> bytes:
         except (OSError, NotImplementedError, PermissionError):
             pass
         return b64_key
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError("no keyring backend and no fallback key file") from e
 
 
 def _load_or_create_key() -> bytes:
+    global _KEY_CACHE
+    with _CACHE_LOCK:
+        if _KEY_CACHE is not None:
+            return _KEY_CACHE
+        key = _load_key_uncached()
+        _KEY_CACHE = key
+        return key
+
+
+def _load_key_uncached() -> bytes:
+    """Load or create the Fernet key without consulting the cache."""
+    keyring_ok = False
     try:
         stored = _keyring_get(_KEY_USERNAME)
         if _is_valid_b64_key(stored):
-            return stored.encode("ascii")
+            return stored.encode("ascii")  # type: ignore[union-attr]
+        # Keyring is reachable but has no valid key — generate one and store it.
         b64_key = Fernet.generate_key()
         _keyring_set(_KEY_USERNAME, b64_key.decode("ascii"))
+        keyring_ok = True
         return b64_key
     except Exception:
+        if keyring_ok:
+            # We already stored the key in the keyring; re-raise so we don't
+            # silently discard a key we just persisted.
+            raise
         return _load_or_create_file_key()
 
 

@@ -143,3 +143,86 @@ async def test_abort_just_word_no_colon():
     # Should not raise — abort_reason may be empty string or the fallback
     result = await agent.handle(failed, {}, "test")
     assert result.retry is False
+
+
+# ── M2: error_body and parameters sanitization ────────────────────────────────
+
+async def test_recovery_error_body_is_sanitized():
+    """M2: error_body is passed through sanitize_for_llm before embedding in prompt."""
+    from unittest.mock import patch as _patch
+
+    sanitized_calls = []
+
+    def tracking_sanitize(text: str) -> str:
+        sanitized_calls.append(text)
+        return text
+
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    failed = _resp(status_code=500, text="error: <script>alert(1)</script>")
+
+    with _patch("ai.decision.recovery.sanitize_for_llm", side_effect=tracking_sanitize):
+        await agent.handle(failed, {"key": "val"}, "create_user")
+
+    # sanitize_for_llm must have been called with the error body text
+    error_body_calls = [c for c in sanitized_calls if "script" in c or "error:" in c]
+    assert error_body_calls, (
+        f"sanitize_for_llm not called with error body. Calls: {sanitized_calls}"
+    )
+
+
+async def test_recovery_parameters_are_sanitized():
+    """M2: original_parameters JSON is passed through sanitize_for_llm."""
+    from unittest.mock import patch as _patch
+
+    sanitized_calls = []
+
+    def tracking_sanitize(text: str) -> str:
+        sanitized_calls.append(text)
+        return text
+
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    failed = _resp(status_code=500, text="err")
+
+    with _patch("ai.decision.recovery.sanitize_for_llm", side_effect=tracking_sanitize):
+        await agent.handle(failed, {"secret_key": "value123"}, "create_user")
+
+    # sanitize_for_llm must have been called with the JSON-serialized parameters
+    param_calls = [c for c in sanitized_calls if "secret_key" in c or "value123" in c]
+    assert param_calls, f"sanitize_for_llm not called with parameters. Calls: {sanitized_calls}"
+
+
+# ── attempt_number in prompt ──────────────────────────────────────────────────
+
+async def test_recovery_attempt_number_in_prompt_first_attempt():
+    """M3 token reduction: attempt_number=0 results in 'Attempt: 1' in the prompt."""
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    failed = _resp(status_code=500, text="err")
+    await agent.handle(failed, {}, "create_user", attempt_number=0)
+
+    content = client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Attempt: 1" in content
+
+
+async def test_recovery_attempt_number_in_prompt_second_attempt():
+    """attempt_number=1 results in 'Attempt: 2' in the prompt."""
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    failed = _resp(status_code=500, text="err")
+    await agent.handle(failed, {}, "create_user", attempt_number=1)
+
+    content = client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Attempt: 2" in content
+
+
+async def test_recovery_default_attempt_number_is_zero():
+    """Default attempt_number=0 when not provided — 'Attempt: 1' in prompt."""
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    failed = _resp(status_code=500, text="err")
+    await agent.handle(failed, {}, "create_user")  # no attempt_number kwarg
+
+    content = client.chat.call_args.kwargs["messages"][0]["content"]
+    assert "Attempt: 1" in content

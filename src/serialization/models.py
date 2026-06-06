@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import json
 from typing import Any
 from urllib.parse import urlparse
 
@@ -22,11 +25,31 @@ _NOISE_KEYS: frozenset[str] = frozenset({
 
 
 def _deep_strip(obj: dict[str, Any], noise: frozenset[str]) -> dict[str, Any]:
-    return {
-        k: _deep_strip(v, noise) if isinstance(v, dict) else v
-        for k, v in obj.items()
-        if k not in noise
-    }
+    result: dict[str, Any] = {}
+    for k, v in obj.items():
+        if k in noise:
+            continue
+        if isinstance(v, dict):
+            result[k] = _deep_strip(v, noise)
+        elif isinstance(v, list):
+            result[k] = [
+                _deep_strip(item, noise) if isinstance(item, dict) else item
+                for item in v
+            ]
+        else:
+            result[k] = v
+    return result
+
+
+def _format_value(v: Any, max_len: int = 120) -> str:
+    """Format a payload value for LLM context output.
+
+    Dicts and lists are serialised as JSON so the LLM receives valid JSON
+    rather than Python repr notation.
+    """
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)[:max_len]
+    return str(v)[:max_len]
 
 
 class CompactStateModel(BaseModel):
@@ -56,7 +79,7 @@ class CompactStateModel(BaseModel):
         path = urlparse(self.endpoint).path or self.endpoint
         lines = [f"{path} → {self.status_code}"]
         for k, v in list(self.payload.items())[:8]:
-            lines.append(f"{k}={str(v)[:120]}")
+            lines.append(f"{k}={_format_value(v)}")
         return sanitize_for_llm("\n".join(lines))
 
     @property

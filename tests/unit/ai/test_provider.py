@@ -352,7 +352,57 @@ async def test_chat_openai_raises_runtime_error_on_timeout():
 
 
 async def test_chat_anthropic_wraps_connect_error():
-    """A connectivity-style exception name gets wrapped as RuntimeError."""
+    """H13: anthropic.APIConnectionError is wrapped as RuntimeError."""
+    import anthropic as _anthropic
+
+    with patch("anthropic.AsyncAnthropic") as mock_cls:
+        backend = MagicMock()
+        backend.messages.create = AsyncMock(
+            side_effect=_anthropic.APIConnectionError(request=MagicMock())
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("anthropic", "key")
+
+        async def fake_wait_for(coro, timeout):
+            return await coro
+
+        with patch("ai.provider.asyncio.wait_for", side_effect=fake_wait_for):
+            with pytest.raises(RuntimeError, match="No connection"):
+                await client.chat(
+                    system="sys",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    max_tokens=64,
+                )
+
+
+async def test_chat_anthropic_wraps_httpx_connect_error():
+    """H13: httpx.ConnectError is wrapped as RuntimeError for anthropic backend."""
+    import httpx
+
+    with patch("anthropic.AsyncAnthropic") as mock_cls:
+        backend = MagicMock()
+        backend.messages.create = AsyncMock(
+            side_effect=httpx.ConnectError("refused")
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("anthropic", "key")
+
+        async def fake_wait_for(coro, timeout):
+            return await coro
+
+        with patch("ai.provider.asyncio.wait_for", side_effect=fake_wait_for):
+            with pytest.raises(RuntimeError, match="No connection"):
+                await client.chat(
+                    system="sys",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    max_tokens=64,
+                )
+
+
+async def test_chat_anthropic_does_not_wrap_arbitrary_connect_named_error():
+    """H13: arbitrary exception with 'connect' in name is NOT swallowed (type-based only)."""
     class FakeConnectError(Exception):
         pass
 
@@ -366,7 +416,8 @@ async def test_chat_anthropic_wraps_connect_error():
             return await coro
 
         with patch("ai.provider.asyncio.wait_for", side_effect=fake_wait_for):
-            with pytest.raises(RuntimeError, match="No connection"):
+            # Should propagate as FakeConnectError, NOT RuntimeError
+            with pytest.raises(FakeConnectError):
                 await client.chat(
                     system="sys",
                     messages=[{"role": "user", "content": "hi"}],
@@ -417,14 +468,13 @@ async def test_chat_anthropic_reraises_non_connect_error():
                 )
 
 
-async def test_chat_anthropic_wraps_network_error():
-    """Exceptions whose class name contains 'network' get wrapped as RuntimeError."""
-    class FakeNetworkError(Exception):
-        pass
+async def test_chat_anthropic_wraps_httpx_network_error():
+    """H13: httpx.NetworkError is wrapped as RuntimeError for anthropic backend."""
+    import httpx
 
     with patch("anthropic.AsyncAnthropic") as mock_cls:
         backend = MagicMock()
-        backend.messages.create = AsyncMock(side_effect=FakeNetworkError("dns"))
+        backend.messages.create = AsyncMock(side_effect=httpx.NetworkError("dns"))
         mock_cls.return_value = backend
         client = LLMClient("anthropic", "key")
 
@@ -442,7 +492,32 @@ async def test_chat_anthropic_wraps_network_error():
 
 
 async def test_chat_openai_wraps_connect_error():
-    """OpenAI connectivity-style exceptions get wrapped as RuntimeError."""
+    """H13: openai.APIConnectionError is wrapped as RuntimeError."""
+    import openai as _openai
+
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            side_effect=_openai.APIConnectionError(request=MagicMock())
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+
+        async def fake_wait_for(coro, timeout):
+            return await coro
+
+        with patch("ai.provider.asyncio.wait_for", side_effect=fake_wait_for):
+            with pytest.raises(RuntimeError, match="No connection"):
+                await client.chat(
+                    system="sys",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    max_tokens=64,
+                )
+
+
+async def test_chat_openai_does_not_wrap_arbitrary_connect_named_error():
+    """H13: arbitrary exception with 'connect' in name is NOT swallowed by OpenAI path."""
     class FakeConnectError(Exception):
         pass
 
@@ -458,7 +533,8 @@ async def test_chat_openai_wraps_connect_error():
             return await coro
 
         with patch("ai.provider.asyncio.wait_for", side_effect=fake_wait_for):
-            with pytest.raises(RuntimeError, match="No connection"):
+            # Should propagate as FakeConnectError, NOT RuntimeError
+            with pytest.raises(FakeConnectError):
                 await client.chat(
                     system="sys",
                     messages=[{"role": "user", "content": "hi"}],
