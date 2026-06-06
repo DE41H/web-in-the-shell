@@ -63,8 +63,10 @@ class ExecutionAgent:
         context = state.to_llm_context() if state else ""
         m = method.upper()
         # GET requests never send a body — skip the LLM refinement call entirely.
-        # Also skip when parameters is empty — no need to ask the LLM to refine nothing.
-        if m == "GET" or not parameters:
+        # Also skip when parameters is empty (or all values are None) — no need to
+        # ask the LLM to refine nothing.
+        _params_empty = not parameters or all(v is None for v in parameters.values())
+        if m == "GET" or _params_empty:
             payload = parameters
         else:
             payload = await self._refine_payload(action, endpoint, parameters, context)
@@ -79,7 +81,10 @@ class ExecutionAgent:
                 elif m == "PATCH":
                     response = await self._dispatch.patch(endpoint, payload)
                 elif m == "DELETE":
-                    response = await self._dispatch.delete(endpoint)
+                    # DELETE requests have no body; non-empty parameters are forwarded
+                    # as URL query parameters so callers can pass filter/id fields.
+                    delete_kwargs = {"params": payload} if payload else {}
+                    response = await self._dispatch.delete(endpoint, **delete_kwargs)
                 else:
                     response = await self._dispatch.post(endpoint, payload)
             except Exception as exc:

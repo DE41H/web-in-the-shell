@@ -67,9 +67,14 @@ def make_llm_empty_response() -> LLMResponse:
     return LLMResponse(tool_calls=[], text="", usage={**_TEST_USAGE, "input": 0, "output": 0})
 
 
-def mock_llm_client(response: LLMResponse | None = None, side_effect=None) -> MagicMock:
+def mock_llm_client(
+    response: LLMResponse | None = None,
+    side_effect=None,
+    provider: str = "anthropic",
+) -> MagicMock:
     """Return a MagicMock LLMClient whose chat() is an AsyncMock."""
     client = MagicMock()
+    client.provider = provider
     if side_effect is not None:
         client.chat = AsyncMock(side_effect=side_effect)
     else:

@@ -121,7 +121,12 @@ async def test_plan_plan_steps_multi_step():
         {"domain": "https://app.example.com", "steps": steps_in},
     ))
     plan = await planner.plan("Multi-step task")
-    assert plan.steps == steps_in
+    # plan_steps normalises missing 'method' to "POST" on each step
+    expected_steps = [
+        {"action": "fetch", "endpoint": "/x", "parameters": {}, "method": "POST"},
+        {"action": "post", "endpoint": "/y", "parameters": {}, "method": "POST"},
+    ]
+    assert plan.steps == expected_steps
     assert plan.target_endpoints == ["/x", "/y"]
     assert plan.action == "fetch"
 
@@ -265,6 +270,35 @@ async def test_plan_without_convos_does_not_load_past(tmp_path: Path):
     assert planner.last_messages[2]["role"] == "user"
     assert isinstance(planner.last_messages[2]["content"], list)
     assert planner.last_messages[2]["content"][0]["type"] == "tool_result"
+
+
+async def test_plan_tool_call_history_openai_format():
+    """OpenAI-compatible providers store tool history in tool_calls/role=tool format."""
+    client = mock_llm_client(
+        make_llm_tool_response(
+            "route_to_domain",
+            {
+                "domain": "https://app.example.com",
+                "endpoints": ["/api/v1/users"],
+                "action": "create_user",
+                "parameters": {"name": "Alice"},
+            },
+        ),
+        provider="gemini",
+    )
+    planner = PlannerAgent(client)
+    await planner.plan("Create a user named Alice")
+
+    # 3 messages: user intent, assistant with tool_calls, tool result
+    assert len(planner.last_messages) == 3
+    asst = planner.last_messages[1]
+    assert asst["role"] == "assistant"
+    assert asst["content"] is None
+    assert isinstance(asst["tool_calls"], list)
+    assert asst["tool_calls"][0]["type"] == "function"
+    tool_msg = planner.last_messages[2]
+    assert tool_msg["role"] == "tool"
+    assert "tool_call_id" in tool_msg
 
 
 async def test_plan_with_convos_prepends_past_messages(tmp_path: Path):
@@ -807,4 +841,255 @@ async def test_plan_caps_past_messages_at_20(tmp_path: Path):
         if m["role"] in ("user", "assistant") and "msg-" in str(m.get("content", ""))
     ]
     assert len(past_in_sent) <= 20, f"Expected ≤ 20 past messages, got {len(past_in_sent)}"
+
+
+# ── Empty-search-results guidance ─────────────────────────────────────────────
+
+async def test_handle_fallback_empty_search_includes_no_results_guidance():
+    """When DuckDuckGo returns '', the LLM prompt must include explicit no-results guidance."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    await planner.handle_fallback("top clubs in bangalore")
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    last_user_content = sent_messages[-1]["content"]
+    assert "No search results were found" in last_user_content
+    assert "Use your knowledge" in last_user_content
+
+
+async def test_handle_fallback_with_search_results_omits_no_results_guidance():
+    """When DuckDuckGo returns content, the 'no results' message must NOT appear."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api/items"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="Some useful search snippet")
+    await planner.handle_fallback("top clubs in bangalore")
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    last_user_content = sent_messages[-1]["content"]
+    assert "No search results were found" not in last_user_content
+    assert "Some useful search snippet" in last_user_content
+
+
+# ── _is_tool_message filtering in handle_fallback ────────────────────────────
+
+async def test_handle_fallback_strips_openai_role_tool_messages():
+    """role='tool' messages (OpenAI format) are filtered out before the fallback LLM call."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    tool_msg = {"role": "tool", "tool_call_id": "abc", "content": '{"q": "foo"}'}
+    await planner.handle_fallback("find something", messages=[tool_msg])
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    assert not any(m.get("role") == "tool" for m in sent_messages), (
+        "role='tool' messages should be stripped before the fallback LLM call"
+    )
+
+
+async def test_handle_fallback_strips_openai_assistant_with_tool_calls():
+    """assistant messages with tool_calls (OpenAI format) are filtered before the fallback call."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    asst_msg = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{"id": "x", "type": "function", "function": {"name": "fn", "arguments": "{}"}}],
+    }
+    await planner.handle_fallback("find something", messages=[asst_msg])
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    assert not any(m.get("tool_calls") for m in sent_messages), (
+        "assistant messages with tool_calls should be stripped before the fallback LLM call"
+    )
+
+
+async def test_handle_fallback_strips_anthropic_tool_use_content_blocks():
+    """Anthropic-format assistant messages with type='tool_use' content blocks are stripped."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    tool_use_msg = {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "tu1", "name": "fallback_search", "input": {"query": "x"}}],
+    }
+    tool_result_msg = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": '{"query": "x"}'}],
+    }
+    plain_user_msg = {"role": "user", "content": "Intent: find something"}
+    await planner.handle_fallback(
+        "find something",
+        messages=[plain_user_msg, tool_use_msg, tool_result_msg],
+    )
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    # tool_use and tool_result blocks must be stripped; plain user message must survive
+    for m in sent_messages:
+        content = m.get("content")
+        if isinstance(content, list):
+            for block in content:
+                assert block.get("type") not in ("tool_use", "tool_result"), (
+                    f"Anthropic tool block leaked into fallback LLM call: {block}"
+                )
+    plain_contents = [m["content"] for m in sent_messages if isinstance(m.get("content"), str)]
+    assert any("Intent: find something" in c for c in plain_contents), (
+        "Plain user message should survive the tool-message strip"
+    )
+
+
+async def test_handle_fallback_preserves_plain_assistant_text_messages():
+    """Plain assistant text messages (no tool_calls, no content list) are NOT stripped."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    plain_asst = {"role": "assistant", "content": "I will help you find it."}
+    await planner.handle_fallback("find something", messages=[plain_asst])
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    asst_msgs = [m for m in sent_messages if m.get("role") == "assistant"]
+    assert any(m.get("content") == "I will help you find it." for m in asst_msgs), (
+        "Plain assistant text messages should not be stripped"
+    )
+
+
+async def test_handle_fallback_preserves_empty_list_content():
+    """Messages with content=[] (empty list) are NOT stripped — any() returns False."""
+    client = mock_llm_client(make_llm_tool_response(
+        "route_to_domain",
+        {
+            "domain": "https://example.com",
+            "endpoints": ["/api"],
+            "action": "list",
+            "parameters": {},
+        },
+    ))
+    planner = PlannerAgent(client)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    empty_content_msg = {"role": "assistant", "content": []}
+    await planner.handle_fallback("find something", messages=[empty_content_msg])
+
+    sent_messages = client.chat.await_args.kwargs["messages"]
+    # empty-list content is not a tool block, so the message should pass through
+    assert any(
+        m.get("role") == "assistant" and m.get("content") == []
+        for m in sent_messages
+    ), "Message with content=[] should NOT be stripped"
+
+
+# ── plan_steps method default normalisation ───────────────────────────────────
+
+async def test_plan_steps_without_method_defaults_to_post():
+    """When LLM omits 'method' from plan_steps steps, each step gets method='POST'."""
+    steps_in = [
+        {"action": "fetch", "endpoint": "/x", "parameters": {}},
+        {"action": "post", "endpoint": "/y", "parameters": {"k": "v"}},
+    ]
+    planner = _planner(make_llm_tool_response(
+        "plan_steps",
+        {"domain": "https://app.example.com", "steps": steps_in},
+    ))
+    plan = await planner.plan("Multi-step task no methods")
+    assert plan.steps[0]["method"] == "POST"
+    assert plan.steps[1]["method"] == "POST"
+
+
+async def test_plan_steps_mixed_methods_normalised():
+    """plan_steps steps with a mix of explicit and absent methods are all normalised."""
+    steps_in = [
+        {"action": "get_thing", "endpoint": "/a", "parameters": {}, "method": "GET"},
+        {"action": "create_thing", "endpoint": "/b", "parameters": {}},  # no method
+        {"action": "del_thing", "endpoint": "/c", "parameters": {}, "method": "DELETE"},
+    ]
+    planner = _planner(make_llm_tool_response(
+        "plan_steps",
+        {"domain": "https://app.example.com", "steps": steps_in},
+    ))
+    plan = await planner.plan("Mixed method steps")
+    assert plan.steps[0]["method"] == "GET"
+    assert plan.steps[1]["method"] == "POST"   # defaulted
+    assert plan.steps[2]["method"] == "DELETE"
+
+
+# ── Error message truncation ──────────────────────────────────────────────────
+
+async def test_plan_no_tool_call_error_is_truncated():
+    """The 'no actionable tool call' error must not include full LLMResponse repr."""
+    long_text = "A" * 500
+    planner = _planner(make_llm_text_response(long_text))
+    with pytest.raises(ValueError) as exc_info:
+        await planner.plan("Do something")
+    msg = str(exc_info.value)
+    # Must contain the anchor text
+    assert "Planner produced no actionable tool call" in msg
+    # Must NOT dump the full long_text (only first 120 chars are included)
+    assert long_text not in msg
+    # Must NOT include usage/model repr (no "LLMResponse(" wrapper)
+    assert "LLMResponse(" not in msg
+
+
+async def test_handle_fallback_no_route_error_is_truncated():
+    """The fallback 'no route_to_domain' error must not include full LLMResponse repr."""
+    from ai.provider import ToolCall
+
+    wrong = make_llm_tool_response("plan_steps", {})
+    wrong.tool_calls = [ToolCall(name="wrong_tool", input={})]
+    wrong.text = "B" * 500
+    planner = _planner(wrong)
+    planner._search_duckduckgo = AsyncMock(return_value="")
+    with pytest.raises(ValueError) as exc_info:
+        await planner.handle_fallback("find something")
+    msg = str(exc_info.value)
+    assert "Fallback planner produced no route_to_domain tool call" in msg
+    assert wrong.text not in msg
+    assert "LLMResponse(" not in msg
 

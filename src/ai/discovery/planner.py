@@ -203,28 +203,47 @@ class PlannerAgent:
         if resp.text:
             messages.append({"role": "assistant", "content": resp.text})
 
-        # H2: append tool-call/tool-result pairs BEFORE saving last_messages
+        # H2: append tool-call/tool-result pairs BEFORE saving last_messages.
+        # Format is provider-specific: Anthropic uses content-block arrays,
+        # OpenAI-compatible providers (Gemini, Groq, etc.) use tool_calls + role=tool.
         if resp.tool_calls:
-            tool_use_content = [
-                {
-                    "type": "tool_use",
-                    "id": tc.id or str(uuid.uuid4()),
-                    "name": tc.name,
-                    "input": tc.input,
-                }
-                for tc in resp.tool_calls
-            ]
-            messages.append({"role": "assistant", "content": tool_use_content})
-
-            tool_result_content = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_content[i]["id"],
-                    "content": json.dumps(tc.input),
-                }
-                for i, tc in enumerate(resp.tool_calls)
-            ]
-            messages.append({"role": "user", "content": tool_result_content})
+            if self._client.provider == "anthropic":
+                tc_ids = [tc.id or str(uuid.uuid4()) for tc in resp.tool_calls]
+                messages.append({
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": tc_ids[i], "name": tc.name, "input": tc.input}
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": tc_ids[i], "content": json.dumps(tc.input)}
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+            else:
+                # OpenAI / Gemini / Groq format
+                tc_ids = [str(uuid.uuid4()) for _ in resp.tool_calls]
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tc_ids[i],
+                            "type": "function",
+                            "function": {"name": tc.name, "arguments": json.dumps(tc.input)},
+                        }
+                        for i, tc in enumerate(resp.tool_calls)
+                    ],
+                })
+                for i, tc in enumerate(resp.tool_calls):
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_ids[i],
+                        "content": json.dumps(tc.input),
+                    })
 
         self.last_messages = list(messages)
 
@@ -256,9 +275,14 @@ class PlannerAgent:
             if call.name == "plan_steps":
                 inp = call.input
                 try:
-                    steps: list[dict] = inp.get("steps", [])
-                    if not steps:
+                    raw_steps: list[dict] = inp.get("steps", [])
+                    if not raw_steps:
                         raise ValueError("plan_steps tool call returned an empty steps list.")
+                    # Normalise each step: apply "POST" default when method is absent
+                    steps = [
+                        {**s, "method": s.get("method", "POST")}
+                        for s in raw_steps
+                    ]
                     first = steps[0]
                     return Plan(
                         target_domain=inp["domain"],
@@ -273,7 +297,10 @@ class PlannerAgent:
             if call.name == "fallback_search":
                 return await self.handle_fallback(call.input["query"], messages=messages)
 
-        raise ValueError(f"Planner produced no actionable tool call. Response: {resp}")
+        raise ValueError(
+            f"Planner produced no actionable tool call. "
+            f"text={resp.text[:120]!r} tool_calls={[c.name for c in resp.tool_calls]}"
+        )
 
     async def _search_duckduckgo(self, query: str) -> str:
         params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
@@ -297,36 +324,65 @@ class PlannerAgent:
         to discover the most likely domain + API endpoint structure and return
         a concrete Plan.
 
-        H1: receives the primary call's message list and APPENDS to it rather
-        than replacing it, so full conversation history is preserved.
+        H1: receives the primary call's message list for history storage.
+        The fallback LLM call itself only receives text-only messages — tool-call
+        history (role=tool, assistant with tool_calls, Anthropic tool_use blocks)
+        is stripped before sending because the fallback uses a different tool set
+        (_FALLBACK_TOOLS = [route_to_domain] only). Sending history that references
+        fallback_search (not in _FALLBACK_TOOLS) causes providers like Gemini to
+        produce 0 output tokens.
         """
         search_results = await self._search_duckduckgo(query)
 
         content = f"Search query: {sanitize_for_llm(query)}\n\n"
         if search_results:
             content += f"Search results:\n{sanitize_for_llm(search_results)}\n\n"
+        else:
+            content += (
+                "No search results were found. "
+                "Use your knowledge to infer the best domain and API structure.\n\n"
+            )
         content += (
             "Based on the above, identify the most likely web application domain "
             "and API endpoints needed to fulfil the intent. Call route_to_domain."
         )
 
-        # H1: extend the existing message list rather than starting fresh
-        if messages is None:
-            messages = []
-        messages.append({"role": "user", "content": content})
+        # H1: keep the full message list for history storage
+        history: list[dict] = list(messages) if messages else []
+
+        # Build a clean message list for the LLM call: strip tool-call messages
+        # (role=tool, assistant.tool_calls, Anthropic content-list blocks) so the
+        # fallback model doesn't see references to tools outside _FALLBACK_TOOLS.
+        def _is_tool_message(m: dict) -> bool:
+            if m.get("role") == "tool":
+                return True
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                return True
+            content = m.get("content")
+            if isinstance(content, list):
+                return any(
+                    isinstance(c, dict) and c.get("type") in ("tool_use", "tool_result")
+                    for c in content
+                )
+            return False
+
+        llm_messages = [m for m in history if not _is_tool_message(m)]
+        llm_messages.append({"role": "user", "content": content})
 
         resp = await self._client.chat(
             system=_FALLBACK_SYSTEM,
-            messages=messages,
+            messages=llm_messages,
             tools=_FALLBACK_TOOLS,
             max_tokens=512,
         )
         self.last_usage = resp.usage
 
+        # Append to full history for storage (not to llm_messages)
+        history.append({"role": "user", "content": content})
         if resp.text:
-            messages.append({"role": "assistant", "content": resp.text})
+            history.append({"role": "assistant", "content": resp.text})
 
-        self.last_messages = list(messages)
+        self.last_messages = list(history)
 
         for call in resp.tool_calls:
             if call.name != "route_to_domain":
@@ -356,5 +412,6 @@ class PlannerAgent:
                 ) from e
 
         raise ValueError(
-            f"Fallback planner produced no route_to_domain tool call. Response: {resp}"
+            f"Fallback planner produced no route_to_domain tool call. "
+            f"text={resp.text[:120]!r} tool_calls={[c.name for c in resp.tool_calls]}"
         )

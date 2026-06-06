@@ -912,6 +912,9 @@ async def _repl(config: SessionConfig) -> None:
                 display.log_thought("Interrupted.")
             except Exception as exc:
                 _handle_api_error(exc, display)
+            # Hold the full-screen Live display so results stay visible before
+            # the alternate screen is restored and the REPL resumes.
+            await display.countdown_exit(3)
 
     _console.print("\n  Goodbye.\n")
 

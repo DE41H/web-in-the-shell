@@ -63,7 +63,7 @@ class RecoveryAgent:
             system=_RECOVERY_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
             tools=[],
-            max_tokens=256,
+            max_tokens=512,
         )
         text = resp.text
 
@@ -78,6 +78,14 @@ class RecoveryAgent:
                 return RecoveryResult(retry=True, revised_parameters=revised)
             except json.JSONDecodeError:
                 pass
+
+        # Fallback: model may return bare JSON without code fences.
+        try:
+            revised = json.loads(text.strip())
+            if isinstance(revised, dict):
+                return RecoveryResult(retry=True, revised_parameters=revised)
+        except (json.JSONDecodeError, ValueError):
+            pass
 
         return RecoveryResult(
             retry=False,

@@ -226,3 +226,78 @@ async def test_recovery_default_attempt_number_is_zero():
 
     content = client.chat.call_args.kwargs["messages"][0]["content"]
     assert "Attempt: 1" in content
+
+
+# ── Bare JSON fallback (no code fences) ──────────────────────────────────────
+
+async def test_recovery_bare_json_without_fences_is_accepted():
+    """Model returning bare JSON (no ``` fences) should still be parsed as revised params."""
+    client = mock_llm_client(make_llm_text_response('{"user": "admin", "role": "editor"}'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "update_role")
+    assert result.retry is True
+    assert result.revised_parameters == {"user": "admin", "role": "editor"}
+
+
+async def test_recovery_bare_json_with_whitespace_is_accepted():
+    """Bare JSON with leading/trailing whitespace is stripped before parsing."""
+    client = mock_llm_client(make_llm_text_response('  \n{"key": "value"}\n  '))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "update")
+    assert result.retry is True
+    assert result.revised_parameters == {"key": "value"}
+
+
+async def test_recovery_bare_json_non_dict_is_rejected():
+    """Bare JSON that is a list or scalar (not a dict) must NOT be accepted."""
+    client = mock_llm_client(make_llm_text_response('[1, 2, 3]'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "action")
+    assert result.retry is False
+    assert result.abort_reason == "Recovery agent returned unparseable output."
+
+
+async def test_recovery_invalid_bare_json_falls_through_to_unparseable():
+    """Text that looks like JSON but is invalid → unparseable fallback."""
+    client = mock_llm_client(make_llm_text_response('{not: valid}'))
+    agent = RecoveryAgent(client)
+    result = await agent.handle(_resp(), {}, "action")
+    assert result.retry is False
+    assert result.abort_reason == "Recovery agent returned unparseable output."
+
+
+# ── max_tokens is at least 512 ────────────────────────────────────────────────
+
+async def test_recovery_max_tokens_at_least_512():
+    """Recovery LLM call must request at least 512 tokens to avoid truncating large JSON."""
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+    await agent.handle(_resp(), {}, "action")
+    call_kwargs = client.chat.call_args.kwargs
+    assert call_kwargs.get("max_tokens", 0) >= 512
+
+
+# ── Sanitization order: truncate first, then sanitize ────────────────────────
+
+async def test_recovery_error_body_truncated_before_sanitize():
+    """error_body[:800] is applied before sanitize_for_llm so the input is bounded."""
+    from unittest.mock import patch as _patch
+
+    call_args_in_order = []
+
+    def tracking_sanitize(text: str) -> str:
+        call_args_in_order.append(len(text))
+        return text
+
+    long_text = "x" * 3000
+    client = mock_llm_client(make_llm_text_response('```json\n{"x": 1}\n```'))
+    agent = RecoveryAgent(client)
+
+    with _patch("ai.decision.recovery.sanitize_for_llm", side_effect=tracking_sanitize):
+        await agent.handle(_resp(text=long_text), {}, "action")
+
+    # The first sanitize call is for error_body; its input must be <= 800 chars
+    assert call_args_in_order[0] <= 800, (
+        f"sanitize_for_llm received {call_args_in_order[0]} chars; "
+        f"truncation must happen BEFORE sanitization"
+    )

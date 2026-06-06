@@ -206,7 +206,11 @@ class LLMClient:
                 args = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
                 args = {}
-            calls.append(ToolCall(name=tc.function.name, input=args))
+            calls.append(ToolCall(
+                name=tc.function.name,
+                input=args,
+                id=getattr(tc, "id", "") or "",
+            ))
 
         u = resp.usage
         return LLMResponse(
@@ -247,6 +251,15 @@ async def fetch_available_models(provider: str, api_key: str) -> list[str]:
             # Groq returns audio/image models too — keep only text/chat models
             text_keys = ("llama", "mixtral", "gemma", "whisper", "deepseek", "qwen")
             names = [n for n in names if any(k in n for k in text_keys)]
+        elif provider == "gemini":
+            # Gemini returns embedding/image/audio/AQA models — keep only generative text models
+            gemini_text_keys = ("gemini",)
+            gemini_exclude = ("embedding", "aqa", "imagen", "vision")
+            names = [
+                n for n in names
+                if any(k in n for k in gemini_text_keys)
+                and not any(x in n for x in gemini_exclude)
+            ]
         return names or fallback
     except Exception:
         return fallback

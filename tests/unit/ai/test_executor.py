@@ -525,3 +525,73 @@ async def test_execute_plan_total_usage_empty_when_no_llm_calls():
     # last_usage is None since _refine_payload was never called
     assert agent.last_usage is None
     assert agent.total_usage == {}
+
+
+# ── DELETE with non-empty parameters passes them as query params ──────────────
+
+async def test_execute_delete_with_params_passes_as_query_params():
+    """DELETE + non-empty parameters → dispatch.delete called with params= kwarg."""
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    dispatch.delete = AsyncMock(return_value=_ok_response())
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="delete", endpoint="/posts/1",
+        parameters={"force": True}, method="DELETE",
+    )
+    assert result.success is True
+    # delete must have been called with params={"force": True}
+    call_kwargs = dispatch.delete.await_args.kwargs
+    assert call_kwargs.get("params") == {"force": True}
+
+
+async def test_execute_delete_no_params_calls_delete_without_params_kwarg():
+    """DELETE + empty parameters → dispatch.delete called with no extra kwargs."""
+    dispatch, exec_client, rec_client = _build('```json\n{}\n```')
+    dispatch.delete = AsyncMock(return_value=_ok_response())
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="delete", endpoint="/posts/1",
+        parameters={}, method="DELETE",
+    )
+    assert result.success is True
+    call_kwargs = dispatch.delete.await_args.kwargs
+    assert "params" not in call_kwargs
+
+
+async def test_execute_delete_skips_llm_refinement_even_with_params():
+    """DELETE with non-empty parameters skips _refine_payload (no body to refine)."""
+    dispatch, exec_client, rec_client = _build('```json\n{"force": false}\n```')
+    dispatch.delete = AsyncMock(return_value=_ok_response())
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    await agent.execute(
+        action="delete", endpoint="/posts/1",
+        parameters={"force": True}, method="DELETE",
+    )
+    # LLM must NOT be called for DELETE regardless of parameters
+    exec_client.chat.assert_not_awaited()
+
+
+# ── All-None parameters: treated as empty, skip LLM refinement ───────────────
+
+async def test_execute_all_none_params_skips_llm_refinement():
+    """parameters={'key': None} is semantically empty — must not call _refine_payload."""
+    dispatch, exec_client, rec_client = _build('```json\n{"key": null}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="create", endpoint="/posts",
+        parameters={"key": None}, method="POST",
+    )
+    assert result.success is True
+    exec_client.chat.assert_not_awaited()
+
+
+async def test_execute_mixed_none_and_real_value_calls_llm_refinement():
+    """parameters={'a': None, 'b': 'val'} is not all-None — must call _refine_payload."""
+    dispatch, exec_client, rec_client = _build('```json\n{"a": null, "b": "val"}\n```')
+    agent = ExecutionAgent(dispatch, exec_client, rec_client)
+    result = await agent.execute(
+        action="create", endpoint="/posts",
+        parameters={"a": None, "b": "val"}, method="POST",
+    )
+    assert result.success is True
+    exec_client.chat.assert_awaited_once()

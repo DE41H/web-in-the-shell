@@ -664,3 +664,155 @@ async def test_fetch_available_models_returns_fallback_on_timeout():
         result = await fetch_available_models("anthropic", "sk-test")
 
     assert result == [DEFAULT_MODELS["anthropic"]]
+
+
+# ── ToolCall.id extraction in _chat_openai ──────────────────────────────────
+
+async def test_chat_openai_extracts_tool_call_id():
+    """_chat_openai must populate ToolCall.id from tc.id (not leave it as empty string)."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        tool_call = SimpleNamespace(
+            id="call_abc123",
+            function=SimpleNamespace(name="route_to_domain", arguments='{"x": 1}'),
+        )
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[tool_call],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="sys",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[_TEST_TOOL],
+            max_tokens=64,
+        )
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].id == "call_abc123"
+
+
+async def test_chat_openai_tool_call_id_defaults_to_empty_string_when_absent():
+    """When tc.id attribute is missing (e.g. mock), ToolCall.id falls back to ''."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        # SimpleNamespace without id attribute
+        tool_call = SimpleNamespace(
+            function=SimpleNamespace(name="route_to_domain", arguments='{"x": 1}'),
+        )
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[tool_call],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="sys",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[_TEST_TOOL],
+            max_tokens=64,
+        )
+    assert result.tool_calls[0].id == ""
+
+
+async def test_chat_openai_tool_call_id_none_coerced_to_empty_string():
+    """When tc.id is None (some providers omit it), ToolCall.id must be '' not None."""
+    with patch("openai.AsyncOpenAI") as mock_cls:
+        tool_call = SimpleNamespace(
+            id=None,
+            function=SimpleNamespace(name="route_to_domain", arguments="{}"),
+        )
+        backend = MagicMock()
+        backend.chat.completions.create = AsyncMock(
+            return_value=SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content="",
+                            tool_calls=[tool_call],
+                        )
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            )
+        )
+        mock_cls.return_value = backend
+        client = LLMClient("openai", "sk-test")
+        result = await client.chat(
+            system="sys",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[_TEST_TOOL],
+            max_tokens=64,
+        )
+    assert result.tool_calls[0].id == ""
+
+
+# ── fetch_available_models — Gemini filtering ───────────────────────────────
+
+async def test_fetch_available_models_gemini_filters_non_chat_models():
+    """Gemini provider keeps only 'gemini-*' models and excludes embedding/aqa/imagen/vision."""
+    from ai.provider import fetch_available_models
+
+    fake_models = [
+        SimpleNamespace(id="gemini-2.0-flash"),
+        SimpleNamespace(id="gemini-1.5-pro"),
+        SimpleNamespace(id="text-embedding-004"),
+        SimpleNamespace(id="gemini-embedding-exp"),
+        SimpleNamespace(id="aqa"),
+        SimpleNamespace(id="imagen-3.0-generate-001"),
+        SimpleNamespace(id="gemini-pro-vision"),
+    ]
+    fake_resp = SimpleNamespace(data=fake_models)
+
+    mock_client = MagicMock()
+    mock_client.models.list = AsyncMock(return_value=fake_resp)
+
+    with patch("openai.AsyncOpenAI", return_value=mock_client):
+        result = await fetch_available_models("gemini", "api-key")
+
+    # Chat-capable models are kept
+    assert "gemini-2.0-flash" in result
+    assert "gemini-1.5-pro" in result
+    # Non-chat models are excluded
+    assert "text-embedding-004" not in result
+    assert "gemini-embedding-exp" not in result
+    assert "aqa" not in result
+    assert "imagen-3.0-generate-001" not in result
+    assert "gemini-pro-vision" not in result
+
+
+async def test_fetch_available_models_gemini_returns_fallback_when_all_filtered():
+    """When all Gemini models are filtered out, the fallback default is returned."""
+    from ai.provider import fetch_available_models, DEFAULT_MODELS
+
+    fake_models = [
+        SimpleNamespace(id="text-embedding-004"),
+        SimpleNamespace(id="imagen-3.0-generate-001"),
+    ]
+    fake_resp = SimpleNamespace(data=fake_models)
+
+    mock_client = MagicMock()
+    mock_client.models.list = AsyncMock(return_value=fake_resp)
+
+    with patch("openai.AsyncOpenAI", return_value=mock_client):
+        result = await fetch_available_models("gemini", "api-key")
+
+    assert result == [DEFAULT_MODELS["gemini"]]
