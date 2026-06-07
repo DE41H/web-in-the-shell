@@ -13,10 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 from pydantic import BaseModel
 
 import httpx
+
+_TEXT_TOOL_RE = re.compile(r'\b([A-Za-z_]\w*)\s*>\s*(\{)')
 
 
 DEFAULT_MODELS: dict[str, str] = {
@@ -73,6 +76,43 @@ class LLMResponse(BaseModel):
 
 class ToolCallFailed(Exception):
     """Raised when the provider reports a tool/function call failure."""
+
+
+def _parse_text_tool_calls(text: str) -> list[ToolCall]:
+    """Extract tool calls embedded as plain text by small/quantized models.
+
+    Some models (e.g. llama-3.1-8b-instant on Groq) ignore the OpenAI
+    tool_calls wire format and instead emit calls like:
+
+        tool_name>{"arg": "val"}<function
+        next_tool>{"arg": "val"}
+
+    This parser finds every ``word>{`` pattern, extracts the full JSON
+    object with a bracket-depth counter, and returns ToolCall objects.
+    Unknown tool names are left to the planner's own validation.
+    """
+    calls: list[ToolCall] = []
+    for m in _TEXT_TOOL_RE.finditer(text):
+        name = m.group(1)
+        start = m.start(2)  # position of the opening '{'
+        depth = 0
+        i = start
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        json_str = text[start : i + 1] if depth == 0 else text[start:]
+        try:
+            args = json.loads(json_str)
+            if isinstance(args, dict):
+                calls.append(ToolCall(name=name, input=args))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return calls
 
 
 def _coerce_tool_args(raw: Any) -> dict[str, Any]:
@@ -281,11 +321,19 @@ class LLMClient:
                 id=getattr(tc, "id", "") or "",
             ))
 
+        text = getattr(msg, "content", None) or ""
+        if not calls and text:
+            calls = _parse_text_tool_calls(text)
+            if calls:
+                logging.debug(
+                    "_chat_openai: extracted %d tool call(s) from text fallback", len(calls)
+                )
+
         usage = _coerce_usage(getattr(resp, "usage", None))
         usage["model"] = self.model
         return LLMResponse(
             tool_calls=calls,
-            text=getattr(msg, "content", None) or "",
+            text=text,
             usage=usage,
             stop_reason=str(getattr(resp.choices[0], "finish_reason", "") or ""),
         )

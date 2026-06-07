@@ -712,7 +712,11 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             except ValueError as exc:
                 if str(exc) == 'Planner produced no actionable tool call':
                     detailed_error_context = f"Initial plan failed: {exc}. Attempting fallback."
-                    plan = await planner.handle_fallback(safe_intent, messages=planner.last_messages, context=detailed_error_context)
+                    plan = await planner.handle_fallback(
+                        safe_intent,
+                        messages=planner.last_messages,
+                        context=detailed_error_context,
+                    )
                 else:
                     display.set_status("Failed")
                     display.log_thought(f"Planning failed: {exc}")
@@ -765,7 +769,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             patterns = [re.escape(ep.split("?")[0]) for ep in plan.target_endpoints]
         else:
             patterns = [r"/"]
-        nav_url = _join_url(target, plan.target_endpoints[0] if plan.target_endpoints else None)
+        nav_url = target
         if not nav_url.startswith(("http://", "https://")):
             nav_url = "https://" + nav_url
 
@@ -826,12 +830,12 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         display.log_thought("URL validation failed — requesting new plan…")
                         planner = PlannerAgent(main_client, convos=convos)
                         plan = await planner.plan(
-                            safe_intent, context=f"Navigation to {nav_url} failed. {info.title}: {info.detail}"
+                            safe_intent,
+                            context=f"Navigation to {nav_url} failed. {info.title}: {info.detail}"
                         )
                         last_planner = planner
                         target = config.target or plan.target_domain
-                        ep0 = plan.target_endpoints[0] if plan.target_endpoints else None
-                        nav_url = _join_url(target, ep0)
+                        nav_url = target
 
                         # Quick reachability probe before attempting browser navigation.
                         try:
@@ -907,8 +911,7 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         )
                         last_planner = planner
                         target = config.target or plan.target_domain
-                        ep0 = plan.target_endpoints[0] if plan.target_endpoints else None
-                        nav_url = _join_url(target, ep0)
+                        nav_url = target
                     finally:
                         nav_attempt += 1
             finally:

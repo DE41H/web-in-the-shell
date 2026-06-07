@@ -6,6 +6,94 @@ from playwright_stealth import Stealth
 
 _stealth = Stealth()
 
+# Realistic Chrome 131 UA — keep in sync with _CONTEXT_KWARGS below.
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+# sec-ch-ua must match the major version in _USER_AGENT.
+_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
+
+_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-setuid-sandbox",
+    "--disable-http2",
+    # Reduce automation signals
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-infobars",
+    "--disable-ipc-flooding-protection",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-background-timer-throttling",
+    "--disable-client-side-phishing-detection",
+    "--disable-features=TranslateUI,IsolateOrigins",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    # Window size must match viewport to avoid outerWidth/innerWidth mismatch.
+    "--window-size=1920,1080",
+]
+
+_CONTEXT_KWARGS = dict(
+    user_agent=_USER_AGENT,
+    viewport={"width": 1920, "height": 1080},
+    bypass_csp=True,
+    locale="en-US",
+    timezone_id="America/New_York",
+    extra_http_headers={
+        "Accept-Language": "en-US,en;q=0.9",
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    },
+)
+
+# JS patches that playwright_stealth doesn't cover.  Injected as an init
+# script so they run before any page script, including anti-bot checks.
+_INIT_SCRIPT = """
+(() => {
+  // hardware concurrency + device memory — common fingerprint values on
+  // a mid-range Windows laptop; consistent with the declared UA.
+  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+  Object.defineProperty(navigator, 'deviceMemory',       {get: () => 8});
+
+  // navigator.connection — absent in headless but present in real Chrome.
+  if (!navigator.connection) {
+    Object.defineProperty(navigator, 'connection', {
+      get: () => ({
+        effectiveType: '4g',
+        rtt: 50,
+        downlink: 10,
+        saveData: false,
+      }),
+    });
+  }
+
+  // Permissions API — return 'default' (not 'denied') for notifications so
+  // the site can't distinguish headless from a real browser.
+  const _origQuery = window.Permissions && window.Permissions.prototype.query;
+  if (_origQuery) {
+    window.Permissions.prototype.query = function(params) {
+      if (params && params.name === 'notifications') {
+        return Promise.resolve({state: 'default', onchange: null});
+      }
+      return _origQuery.call(this, params);
+    };
+  }
+
+  // Ensure window.chrome is a non-null object (headless Chromium sometimes
+  // leaves it undefined, which is a trivial bot signal).
+  if (!window.chrome) {
+    window.chrome = {runtime: {}};
+  }
+})();
+"""
+
 
 class StealthBrowser:
     """Headless Chromium hardened against bot-detection fingerprinting."""
@@ -20,24 +108,10 @@ class StealthBrowser:
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-setuid-sandbox",
-                "--disable-http2",
-            ],
+            args=_LAUNCH_ARGS,
         )
-        self._context = await self._browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1920, "height": 1080},
-            bypass_csp=True,
-        )
+        self._context = await self._browser.new_context(**_CONTEXT_KWARGS)
+        await self._context.add_init_script(_INIT_SCRIPT)
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -86,25 +160,11 @@ class StealthBrowser:
         # human can actually interact with it.
         login_browser: Browser = await self._playwright.chromium.launch(
             headless=False,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-setuid-sandbox",
-                "--disable-http2",
-            ],
+            args=_LAUNCH_ARGS,
         )
         try:
-            login_context = await login_browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1920, "height": 1080},
-                bypass_csp=True,
-            )
+            login_context = await login_browser.new_context(**_CONTEXT_KWARGS)
+            await login_context.add_init_script(_INIT_SCRIPT)
             page = await login_context.new_page()
             await _stealth.apply_stealth_async(page)
             await page.goto(url)
