@@ -21,11 +21,10 @@ class RecoveryResult:
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]+?)\s*```")
 
 _RECOVERY_SYSTEM = (
-    "You are a recovery agent for a headless HTTP automation system. "
-    "When given a failed HTTP response, diagnose the root cause and either: "
-    "(a) output revised request parameters as a ```json block, or "
-    "(b) output ABORT: <reason> if the failure is unrecoverable. "
-    "Be terse. No prose outside of those two formats."
+    "Fix a failed HTTP request. "
+    "Output revised parameters as a ```json block, "
+    "or ABORT: <reason> if unrecoverable. "
+    "No prose outside those two formats."
 )
 
 _RECOVERY_MAX_TOKENS = 512

@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
+from network.dispatch.headers import USER_AGENT, SEC_CH_UA
 from network.dispatch.ratelimit import TokenBucket, parse_retry_after
 from network.dispatch.ssrf_transport import SSRFTransport
 from network.session.manager import SessionManager
@@ -89,6 +90,16 @@ class DispatchClient:
         creds = self._session.credentials
         if creds.cookies:
             h["Cookie"] = "; ".join(f"{k}={v}" for k, v in creds.cookies.items())
+        # Inject realistic browser headers so sites don't 403/406 on missing UA,
+        # client-hint mismatches, or missing Accept. All use setdefault so that
+        # session credentials (bearer, CSRF, extra_headers) always win.
+        h.setdefault("User-Agent", USER_AGENT)
+        h.setdefault("Accept", "application/json, text/html, */*;q=0.8")
+        h.setdefault("Accept-Language", "en-US,en;q=0.9")
+        h.setdefault("Accept-Encoding", "gzip, deflate, br")
+        h.setdefault("sec-ch-ua", SEC_CH_UA)
+        h.setdefault("sec-ch-ua-mobile", "?0")
+        h.setdefault("sec-ch-ua-platform", '"Windows"')
         return h
 
     def _guard(self, endpoint: str) -> None:
@@ -121,10 +132,18 @@ class DispatchClient:
         req_headers = kwargs.pop("headers", None) or {}
         content = kwargs.pop("content", None)
         attempt = 0
+        parsed_url = urllib.parse.urlparse(url)
+        origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
         while True:
             await bucket.acquire()
             merged_headers = dict(self._live_headers())
             merged_headers.update(req_headers)
+
+            # Origin and Referer make the request look like normal in-site
+            # navigation. Both use setdefault so callers can override.
+            merged_headers.setdefault("Referer", origin + "/")
+            if method.upper() not in ("GET", "HEAD"):
+                merged_headers.setdefault("Origin", origin)
 
             if content is not None and not isinstance(content, (str, bytes)) and (
                 hasattr(content, "__aiter__") or hasattr(content, "__iter__")

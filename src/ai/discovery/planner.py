@@ -190,31 +190,21 @@ def _validate_against_schema(schema: dict, data: Any, path: str = "") -> None:
         raise ValueError(str(e)) from e
 
 _SYSTEM = (
-    "Routing agent: map a user's intent to the real production domain, API endpoints, "
-    "action, and parameters.\n"
-    "Rules:\n"
-    "• domain must be scheme + host only — no path (e.g. https://api.github.com, "
-    "https://www.reddit.com). Never example.com, localhost, or search engines.\n"
-    "• Include www. only when the canonical site requires it. Prefer API subdomains "
-    "when the task is programmatic (e.g. api.twitter.com over twitter.com).\n"
-    "• If uncertain between two plausible domains (e.g. www variant vs bare, "
-    "regional subdomain), add 1-2 alternatives in candidate_domains.\n"
-    "• If the target domain is completely unknown, call fallback_search.\n"
-    "• Use plan_steps for goals requiring more than one sequential API call.\n"
-    "• Output only tool calls — no prose."
+    "Map user intent to a production domain, API endpoints, action, and parameters.\n"
+    "• domain: scheme + host only, no path. Never example.com, localhost, or search engines.\n"
+    "• Prefer API subdomains for programmatic tasks.\n"
+    "• If uncertain, add 1-2 alternatives in candidate_domains.\n"
+    "• If domain is unknown, call fallback_search.\n"
+    "• Use plan_steps for multi-step goals.\n"
+    "Output only tool calls."
 )
 
 _FALLBACK_SYSTEM = (
-    "Discovery agent for a headless AI browser. Given a search query and optional "
-    "search results, identify multiple relevant production domains and their "
-    "API structures, then call route_to_domain.\n"
-    "• When the user intent implies a list or multiple results "
-    "(e.g., 'top 3 pubs', 'list all users'), "
-    "prioritize identifying all relevant API endpoints for retrieving such lists.\n"
-    "• domain must be scheme + host only (e.g. https://www.example.com) — no path.\n"
-    "• Include candidate_domains with www/non-www or regional alternatives when "
-    "uncertain.\n"
-    "• Output only a tool call — no prose."
+    "Given search results, identify the production domain and API structure. "
+    "Call route_to_domain with: domain (scheme+host only, no path), "
+    "endpoints, action, parameters. "
+    "Add candidate_domains for www/non-www variants when uncertain. "
+    "Output only a tool call."
 )
 
 _FALLBACK_TOOLS = [_TOOL_ROUTE_TO_DOMAIN]
@@ -287,8 +277,12 @@ class PlannerAgent:
                 or "tool_use_failed" in txt
                 or "failed_generation" in txt
             ):
-                # Ask the fallback handler to try discovery using the intent
-                return await self.handle_fallback(safe_intent, messages=messages)
+                try:
+                    return await self.handle_fallback(safe_intent, messages=messages)
+                except Exception as fb_exc:
+                    raise ValueError(
+                        f"Planner and fallback both failed: {fb_exc}"
+                    ) from fb_exc
             raise
         self.last_usage = resp.usage
 
@@ -504,12 +498,17 @@ class PlannerAgent:
         llm_messages = [m for m in history if not _is_tool_message(m)]
         llm_messages.append({"role": "user", "content": content})
 
-        resp = await self._client.chat(
-            system=_FALLBACK_SYSTEM,
-            messages=llm_messages,
-            tools=_FALLBACK_TOOLS,
-            max_tokens=_FALLBACK_MAX_TOKENS,
-        )
+        try:
+            resp = await self._client.chat(
+                system=_FALLBACK_SYSTEM,
+                messages=llm_messages,
+                tools=_FALLBACK_TOOLS,
+                max_tokens=_FALLBACK_MAX_TOKENS,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"Fallback planner LLM call failed: {exc}"
+            ) from exc
         self.last_usage = resp.usage
 
         # Append to full history for storage (not to llm_messages)

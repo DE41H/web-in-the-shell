@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "MIT"}
 authors = [
-    {name = "DE41H", email = "[email protected]"},
+    {name = "DE41H", email = "f20250721@pilani.bits-pilani.ac.in"},
 ]
 keywords = ["ai-agent", "web-automation", "playwright", "llm", "agentic-web", "hackathon"]
 classifiers = [

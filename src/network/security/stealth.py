@@ -4,17 +4,9 @@ import sys
 from playwright.async_api import async_playwright, Browser, BrowserContext, Dialog, Page, Playwright
 from playwright_stealth import Stealth
 
+from network.dispatch.headers import USER_AGENT as _USER_AGENT, SEC_CH_UA as _SEC_CH_UA
+
 _stealth = Stealth()
-
-# Realistic Chrome 131 UA — keep in sync with _CONTEXT_KWARGS below.
-_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
-)
-
-# sec-ch-ua must match the major version in _USER_AGENT.
-_SEC_CH_UA = '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"'
 
 _LAUNCH_ARGS = [
     "--no-sandbox",

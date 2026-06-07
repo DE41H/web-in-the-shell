@@ -23,8 +23,8 @@ _MAX_RETRIES = 3
 _JSON_BLOCK_RE = re.compile(r"```json\s*([\s\S]+?)\s*```")
 
 _EXECUTOR_SYSTEM = (
-    "Construct the exact JSON body for an HTTP request. "
-    "Output only a single ```json block. No prose."
+    "Output the JSON request body for the given action and endpoint. "
+    "Single ```json block only. No prose, no explanation."
 )
 
 _EXECUTOR_MAX_TOKENS = 192

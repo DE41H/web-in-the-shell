@@ -671,10 +671,11 @@ async def _prompt_and_fill_forms(
 
 def _build_replan_context(executor: ExecutionAgent, results: list[ExecutionResult]) -> str:
     failed = [r for r in results if not r.success]
-    parts = ["Previous execution failed:"]
-    parts += [f"  {r.endpoint} → HTTP {r.status_code}: {r.error}" for r in failed]
+    parts = ["Previous attempt failed:"]
+    parts += [f"  {r.endpoint} HTTP {r.status_code}: {r.error}" for r in failed]
     if executor.state_history:
-        parts += ["", "State at failure:"] + [s.to_llm_context() for s in executor.state_history]
+        # Send only the most recent state to keep context small for smaller models.
+        parts += ["", "Last state:", executor.state_history[-1].to_llm_context()]
     return "\n".join(parts)
 
 
@@ -949,8 +950,12 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                         display.set_status("Recovering")
                         display.log_thought(f"Replanning (attempt {attempt}/{config.replan})…")
                         if not config.mock:
-                            planner      = PlannerAgent(main_client, convos=convos)
-                            plan         = await planner.plan(safe_intent, context=replan_ctx)
+                            planner = PlannerAgent(main_client, convos=convos)
+                            try:
+                                plan = await planner.plan(safe_intent, context=replan_ctx)
+                            except Exception as exc:
+                                display.log_thought(f"Replan failed: {exc}")
+                                break
                             last_planner = planner
 
                     display.set_status("Executing")
