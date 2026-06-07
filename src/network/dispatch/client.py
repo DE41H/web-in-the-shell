@@ -5,7 +5,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
-from network.dispatch.headers import USER_AGENT, SEC_CH_UA
+from network.dispatch.headers import USER_AGENT, SEC_CH_UA, SEC_FETCH_HEADERS
 from network.dispatch.ratelimit import TokenBucket, parse_retry_after
 from network.dispatch.ssrf_transport import SSRFTransport
 from network.session.manager import SessionManager
@@ -144,6 +144,11 @@ class DispatchClient:
             merged_headers.setdefault("Referer", origin + "/")
             if method.upper() not in ("GET", "HEAD"):
                 merged_headers.setdefault("Origin", origin)
+
+            # Sec-Fetch-* headers are sent by Chrome on every request; WAFs flag
+            # their absence as a bot signal.
+            for k, v in SEC_FETCH_HEADERS.items():
+                merged_headers.setdefault(k, v)
 
             if content is not None and not isinstance(content, (str, bytes)) and (
                 hasattr(content, "__aiter__") or hasattr(content, "__iter__")

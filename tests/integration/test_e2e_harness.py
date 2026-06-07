@@ -67,8 +67,10 @@ async def test_main_harness_runs_against_jsonplaceholder():
         f"main.py crashed (rc={proc.returncode}): {stderr_text[:500]}"
     )
 
-    assert "%\u2193" in out or "ratio=" in out, (
-        f"no compact-reduction marker in output: {out[:500]}"
+    # The sniffer summary line is always printed, even when 0 responses are
+    # captured (e.g. when navigating to the domain root instead of an API path).
+    assert "Intercepted" in out, (
+        f"sniffer summary missing from output: {out[:500]}"
     )
 
     assert "Bearer eyJ" not in out

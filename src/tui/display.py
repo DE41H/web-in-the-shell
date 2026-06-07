@@ -97,6 +97,7 @@ class AgentDisplay:
         self._cost_line: str = ""
         self._started_at: datetime = datetime.now()
         self._summary: str = ""
+        self._answer: str = ""
         self._errors: list[ErrorInfo] = []
         self._layout = Layout()
         self._layout.split_row(
@@ -158,6 +159,11 @@ class AgentDisplay:
             body.append("\n  " + "─" * 36 + "\n", style="dim white")
             body.append(f"  {self._cost_line}\n", style="bold green")
 
+        if self._answer:
+            body.append("\n  " + "─" * 36 + "\n", style="dim white")
+            body.append("  ▶  ", style="bold bright_green")
+            body.append(escape(self._answer) + "\n", style="bold bright_green")
+
         if self._summary:
             body.append("\n  " + "─" * 36 + "\n", style="dim white")
             body.append(f"  {escape(self._summary)}\n", style=style)
@@ -192,21 +198,27 @@ class AgentDisplay:
         table.add_column("COMPACT", justify="right",  max_width=9)
         table.add_column("RATIO",   justify="right",  max_width=7)
 
-        for cap in self._intercepts[-20:]:
-            raw, compact, status = cap["raw_bytes"], cap["compact_bytes"], cap["status"]
-            ratio = f"{int((1 - compact / max(raw, 1)) * 100)}%" if raw else "—"
-            st_style = (
-                "green" if 200 <= status < 300
-                else "yellow" if status < 500
-                else "red"
-            )
+        if not self._intercepts:
             table.add_row(
-                f"…{cap['url'][-33:]}",
-                Text(str(status), style=st_style),
-                f"{raw:,}b",
-                f"{compact:,}b",
-                Text(ratio, style="green"),
+                Text("Listening for API responses…", style="dim white"),
+                "", "", "", "",
             )
+        else:
+            for cap in self._intercepts[-20:]:
+                raw, compact, status = cap["raw_bytes"], cap["compact_bytes"], cap["status"]
+                ratio = f"{int((1 - compact / max(raw, 1)) * 100)}%" if raw else "—"
+                st_style = (
+                    "green" if 200 <= status < 300
+                    else "yellow" if status < 500
+                    else "red"
+                )
+                table.add_row(
+                    f"…{cap['url'][-33:]}",
+                    Text(str(status), style=st_style),
+                    f"{raw:,}b",
+                    f"{compact:,}b",
+                    Text(ratio, style="green"),
+                )
 
         footer = Text()
         footer.append("\n  total intercepts: ", style="dim white")
@@ -338,6 +350,13 @@ class AgentDisplay:
             return
         self._refresh()
 
+    def set_answer(self, text: str) -> None:
+        self._answer = _redact(text)
+        if self._plain:
+            print(f"[ANSWER] {self._answer}")
+            return
+        self._refresh()
+
     def log_error(self, error: ErrorInfo) -> None:
         """Record a structured error from :mod:`ai.errors` for the operator.
 
@@ -436,6 +455,25 @@ class AgentDisplay:
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
+
+    def print_result_card(self) -> None:
+        """Print a brief result card to the scrollback buffer (after Live teardown).
+
+        Prints answer (if any), final status, elapsed time, and cost so the
+        operator has a persistent record after the alternate screen closes.
+        """
+        lines: list[tuple[str, str]] = []
+        status_style = _STATUS_STYLE.get(self._status, "white")
+        icon = _STATUS_ICON.get(self._status, " ")
+        lines.append((f"{icon} {self._status}  ·  {self._format_elapsed()}", status_style))
+        if self._answer:
+            lines.append(("▶  " + self._answer, "bold bright_green"))
+        if self._cost_line:
+            lines.append((self._cost_line, "green"))
+        self._console.print()
+        for text, style in lines:
+            self._console.print(f"  {text}", style=style)
+        self._console.print()
 
     def __enter__(self) -> AgentDisplay:
         if _NO_COLOR:

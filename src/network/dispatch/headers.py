@@ -1,4 +1,4 @@
-CHROME_VERSION = "131"
+CHROME_VERSION = "136"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -9,5 +9,11 @@ USER_AGENT = (
 SEC_CH_UA = (
     f'"Google Chrome";v="{CHROME_VERSION}", '
     f'"Chromium";v="{CHROME_VERSION}", '
-    '"Not_A Brand";v="24"'
+    '"Not_A Brand";v="99"'
 )
+
+SEC_FETCH_HEADERS: dict[str, str] = {
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+}

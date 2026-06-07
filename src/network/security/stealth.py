@@ -4,7 +4,11 @@ import sys
 from playwright.async_api import async_playwright, Browser, BrowserContext, Dialog, Page, Playwright
 from playwright_stealth import Stealth
 
-from network.dispatch.headers import USER_AGENT as _USER_AGENT, SEC_CH_UA as _SEC_CH_UA
+from network.dispatch.headers import (
+    USER_AGENT as _USER_AGENT,
+    SEC_CH_UA as _SEC_CH_UA,
+    SEC_FETCH_HEADERS as _SEC_FETCH_HEADERS,
+)
 
 _stealth = Stealth()
 
@@ -14,7 +18,6 @@ _LAUNCH_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-extensions",
     "--disable-setuid-sandbox",
-    "--disable-http2",
     # Reduce automation signals
     "--no-first-run",
     "--no-default-browser-check",
@@ -42,6 +45,7 @@ _CONTEXT_KWARGS = dict(
         "sec-ch-ua": _SEC_CH_UA,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
+        **_SEC_FETCH_HEADERS,
     },
 )
 
@@ -95,6 +99,7 @@ class StealthBrowser:
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
+        self._login_browser: Browser | None = None
 
     async def __aenter__(self) -> "StealthBrowser":
         self._playwright = await async_playwright().start()
@@ -111,6 +116,9 @@ class StealthBrowser:
             await self._context.close()
         if self._browser:
             await self._browser.close()
+        if self._login_browser:
+            await self._login_browser.close()
+            self._login_browser = None
         if self._playwright:
             await self._playwright.stop()
 
@@ -149,13 +157,13 @@ class StealthBrowser:
             raise RuntimeError("Browser not launched. Use 'async with StealthBrowser()' first.")
 
         # Always launch the login browser in non-headless (visible) mode so the
-        # human can actually interact with it.
-        login_browser: Browser = await self._playwright.chromium.launch(
+        # human can actually interact with it.  Stored on self so __aexit__ closes it.
+        self._login_browser = await self._playwright.chromium.launch(
             headless=False,
             args=_LAUNCH_ARGS,
         )
         try:
-            login_context = await login_browser.new_context(**_CONTEXT_KWARGS)
+            login_context = await self._login_browser.new_context(**_CONTEXT_KWARGS)
             await login_context.add_init_script(_INIT_SCRIPT)
             page = await login_context.new_page()
             await _stealth.apply_stealth_async(page)
@@ -178,5 +186,6 @@ class StealthBrowser:
 
             return page
         except Exception:
-            await login_browser.close()
+            await self._login_browser.close()
+            self._login_browser = None
             raise

@@ -43,6 +43,7 @@ from ai.provider import (
     fetch_available_models,
 )
 from ai.discovery.planner import PlannerAgent, Plan
+from ai.decision.answer import AnswerAgent
 from ai.decision.executor import ExecutionAgent, ExecutionResult
 from ai.errors import classify
 from persistence import (
@@ -712,11 +713,9 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                 plan = await planner.plan(safe_intent)
             except ValueError as exc:
                 if str(exc) == 'Planner produced no actionable tool call':
-                    detailed_error_context = f"Initial plan failed: {exc}. Attempting fallback."
                     plan = await planner.handle_fallback(
                         safe_intent,
                         messages=planner.last_messages,
-                        context=detailed_error_context,
                     )
                 else:
                     display.set_status("Failed")
@@ -937,22 +936,49 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
             async with DispatchClient(session, base_url=target) as dispatch:
                 if config.mock:
                     executor = None
+                    answer_agent = None
                 else:
                     assert main_client is not None
                     assert recovery_client is not None
                     executor = ExecutionAgent(dispatch, main_client, recovery_client)
+                    answer_agent = AnswerAgent(recovery_client)
                 replan_ctx      = ""
                 overall_success = False
                 results: list[ExecutionResult] = []
 
                 for attempt in range(config.replan + 1):
                     if attempt > 0:
-                        display.set_status("Recovering")
+                        display.set_status(f"Recovering ({attempt}/{config.replan})")
                         display.log_thought(f"Replanning (attempt {attempt}/{config.replan})…")
                         if not config.mock:
                             planner = PlannerAgent(main_client, convos=convos)
+                            # 403/404/410 = wrong endpoint or missing auth;
+                            # status 0 = network-level failure (connection refused,
+                            # ReadError, unreachable host) — the chosen domain is wrong.
+                            # In all these cases replanning with the same intent produces
+                            # the same bad result.  Use handle_fallback (DuckDuckGo search)
+                            # so the model gets real API docs before choosing a domain/endpoint.
+                            _needs_discovery = (
+                                results
+                                and any(not r.success for r in results)
+                                and all(
+                                    r.status_code in (0, 403, 404, 410)
+                                    for r in results
+                                    if not r.success
+                                )
+                            )
                             try:
-                                plan = await planner.plan(safe_intent, context=replan_ctx)
+                                if _needs_discovery:
+                                    display.log_thought(
+                                        "Running API discovery search to find correct endpoint…"
+                                    )
+                                    plan = await planner.handle_fallback(
+                                        safe_intent, messages=[]
+                                    )
+                                else:
+                                    plan = await planner.plan(
+                                        safe_intent, context=replan_ctx
+                                    )
                             except Exception as exc:
                                 display.log_thought(f"Replan failed: {exc}")
                                 break
@@ -1024,10 +1050,31 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
                                     display.log_error(result.error_info)
 
                     overall_success = all(r.success for r in results)
-                    if overall_success or config.mock:
+                    if config.mock:
+                        break
+
+                    _goal_replan_ctx = ""
+                    if overall_success and answer_agent is not None:
+                        satisfied, answer_text = await answer_agent.synthesize(
+                            safe_intent, results
+                        )
+                        display.log_thought(
+                            f"{'▶ ' if satisfied else '✗ Goal not met: '}{answer_text}"
+                        )
+                        if satisfied:
+                            display.set_answer(answer_text)
+                            break
+                        overall_success = False
+                        _goal_replan_ctx = (
+                            f"API returned data but goal was not achieved: {answer_text}"
+                        )
+
+                    if overall_success:
                         break
                     assert executor is not None
-                    replan_ctx = _build_replan_context(executor, results)
+                    replan_ctx = (
+                        _goal_replan_ctx or _build_replan_context(executor, results)
+                    )
 
                 # ── Save conversation memory ─────────────────────────────
                 if overall_success:
@@ -1077,8 +1124,6 @@ async def _run(config: SessionConfig, display: AgentDisplay, intent: str) -> Non
 
     display.log_thought("─" * 60)
     display.log_thought("Pipeline complete.")
-    if config.no_interactive:
-        await display.countdown_exit(5)
 
 
 # ---------------------------------------------------------------------------
@@ -1250,8 +1295,8 @@ async def _repl(config: SessionConfig) -> None:
                 _handle_api_error(exc, display)
             # Interactive runs: hold the full-screen display until the operator
             # presses Enter so results stay readable before teardown.
-            # --no-interactive runs use the auto-countdown branch below.
             await display.wait_for_enter()
+        display.print_result_card()
 
     _console.print("\n  Goodbye.\n")
 
@@ -1319,9 +1364,9 @@ async def _run_memory(args: argparse.Namespace, parser: argparse.ArgumentParser)
             parser.error("--memory list takes no arguments")
         await _memory_list()
     elif cmd == "clear":
-        if len(rest) != 1:
-            parser.error("--memory clear requires exactly one INTENT argument")
-        await _memory_clear(rest[0])
+        if not rest:
+            parser.error("--memory clear requires an INTENT argument")
+        await _memory_clear(" ".join(rest))
     elif cmd == "clear-all":
         if rest:
             parser.error("--memory clear-all takes no arguments")
@@ -1360,6 +1405,7 @@ async def main() -> None:
                 display.set_status("Interrupted")
             except Exception as exc:
                 _handle_api_error(exc, display)
+        display.print_result_card()
         return
 
     # ── Interactive REPL session ─────────────────────────────────────────

@@ -575,8 +575,8 @@ async def test_execute_delete_skips_llm_refinement_even_with_params():
 
 # ── All-None parameters: treated as empty, skip LLM refinement ───────────────
 
-async def test_execute_all_none_params_skips_llm_refinement():
-    """parameters={'key': None} is semantically empty — must not call _refine_payload."""
+async def test_execute_all_none_params_calls_llm_refinement():
+    """parameters={'key': None} has keys — LLM should refine the None placeholders."""
     dispatch, exec_client, rec_client = _build('```json\n{"key": null}\n```')
     agent = ExecutionAgent(dispatch, exec_client, rec_client)
     result = await agent.execute(
@@ -584,7 +584,7 @@ async def test_execute_all_none_params_skips_llm_refinement():
         parameters={"key": None}, method="POST",
     )
     assert result.success is True
-    exec_client.chat.assert_not_awaited()
+    exec_client.chat.assert_awaited_once()
 
 
 async def test_execute_mixed_none_and_real_value_calls_llm_refinement():
@@ -640,7 +640,7 @@ async def test_execute_refine_payload_uses_bounded_max_tokens():
     agent = ExecutionAgent(dispatch, exec_client, rec_client)
     await agent.execute(action="create", endpoint="/posts", parameters={"x": 1})
     call_kwargs = exec_client.chat.call_args.kwargs
-    assert call_kwargs["max_tokens"] <= 256
+    assert call_kwargs["max_tokens"] <= 512
 
 
 async def test_execute_refine_payload_accepts_bare_json_fallback():

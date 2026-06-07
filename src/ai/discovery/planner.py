@@ -76,7 +76,6 @@ _TOOL_ROUTE_TO_DOMAIN = ToolSchema(
                     "Primary base URL of the target application (scheme + host only, "
                     "no path). Example: https://api.github.com"
                 ),
-                "pattern": "^https?://",
             },
             "candidate_domains": {
                 "type": "array",
@@ -89,7 +88,7 @@ _TOOL_ROUTE_TO_DOMAIN = ToolSchema(
             },
             "endpoints": {
                 "type": "array",
-                "items": {"type": "string", "pattern": "^/"},
+                "items": {"type": "string"},
                 "description": "API endpoint paths to intercept. Each must start with '/'.",
             },
             "action": {
@@ -134,7 +133,6 @@ _TOOL_PLAN_STEPS = ToolSchema(
             "domain": {
                 "type": "string",
                 "description": "Full base URL of the target application.",
-                "pattern": "^https?://",
             },
             "steps": {
                 "type": "array",
@@ -149,7 +147,6 @@ _TOOL_PLAN_STEPS = ToolSchema(
                         "endpoint": {
                             "type": "string",
                             "description": "API endpoint path for this step.",
-                            "pattern": "^/",
                         },
                         "parameters": {
                             "type": "object",
@@ -191,11 +188,15 @@ def _validate_against_schema(schema: dict, data: Any, path: str = "") -> None:
 
 _SYSTEM = (
     "Map user intent to a production domain, API endpoints, action, and parameters.\n"
-    "• domain: scheme + host only, no path. Never example.com, localhost, or search engines.\n"
-    "• Prefer API subdomains for programmatic tasks.\n"
-    "• If uncertain, add 1-2 alternatives in candidate_domains.\n"
-    "• If domain is unknown, call fallback_search.\n"
-    "• Use plan_steps for multi-step goals.\n"
+    "• domain: scheme + host only, no path."
+    " Never search engines (google, bing, duckduckgo), example.com, localhost.\n"
+    "• Species/taxonomy: api.gbif.org  /v1/species/match  GET  params={name}.\n"
+    "• Encyclopaedic facts: en.wikipedia.org"
+    "  /api/rest_v1/page/summary/<Article_Title>  GET  params={}.\n"
+    "• Countries: restcountries.com  /v3.1/name/<country>  GET.\n"
+    "• Weather: api.open-meteo.com  /v1/forecast  GET.\n"
+    "• method=GET for read-only lookups. Prefer API subdomains.\n"
+    "• Unknown domain → call fallback_search. Multi-step → plan_steps.\n"
     "Output only tool calls."
 )
 
@@ -210,8 +211,8 @@ _FALLBACK_SYSTEM = (
 _FALLBACK_TOOLS = [_TOOL_ROUTE_TO_DOMAIN]
 
 _MAX_HISTORY_MESSAGES = 12
-_PLANNER_MAX_TOKENS = 384
-_FALLBACK_MAX_TOKENS = 384
+_PLANNER_MAX_TOKENS = 512
+_FALLBACK_MAX_TOKENS = 512
 
 # Simple in-memory plan cache to reduce repeated LLM calls for identical intents.
 # Keyed by (intent, context_snippet). Size bounded to avoid memory growth.
@@ -599,6 +600,63 @@ class PlannerAgent:
                 raise ValueError(
                     f"Malformed route_to_domain tool call in fallback — missing key {e}"
                 ) from e
+
+        # If the model returned nothing (empty text + no tool calls), retry once
+        # with a simpler, more direct prompt before giving up.
+        if not resp.text and not resp.tool_calls:
+            retry_content = (
+                f"Intent: {sanitize_for_llm(query)}\n"
+                "Call route_to_domain with the best public API domain and endpoint "
+                "to answer this. Use method=GET for read-only lookups."
+            )
+            try:
+                retry_resp = await self._client.chat(
+                    system=_FALLBACK_SYSTEM,
+                    messages=[{"role": "user", "content": retry_content}],
+                    tools=_FALLBACK_TOOLS,
+                    max_tokens=_FALLBACK_MAX_TOKENS,
+                )
+            except Exception:
+                retry_resp = resp  # fall through to the raise below
+
+            for call in retry_resp.tool_calls:
+                if call.name != "route_to_domain":
+                    continue
+                inp = call.input
+                try:
+                    if "endpoints" not in inp:
+                        raise KeyError("endpoints")
+                    domain = _normalize_domain(inp["domain"])
+                    candidates = [
+                        _normalize_domain(d)
+                        for d in inp.get("candidate_domains", [])
+                        if isinstance(d, str) and d.strip()
+                    ]
+                    endpoints = inp.get("endpoints", [])
+                    endpoints = [
+                        (e if e.startswith("/") else "/" + e)[:200] for e in endpoints
+                    ]
+                    first_endpoint = endpoints[0] if endpoints else ""
+                    steps = [
+                        {
+                            "action": inp["action"],
+                            "endpoint": first_endpoint,
+                            "parameters": inp["parameters"],
+                            "method": inp.get("method", "POST"),
+                        }
+                    ]
+                    return Plan(
+                        target_domain=domain,
+                        target_endpoints=endpoints,
+                        action=inp["action"],
+                        parameters=inp["parameters"],
+                        steps=steps,
+                        candidate_domains=candidates,
+                    )
+                except KeyError as e:
+                    raise ValueError(
+                        f"Malformed route_to_domain tool call in fallback retry — missing key {e}"
+                    ) from e
 
         raise ValueError(
             f"Fallback planner produced no route_to_domain tool call. "

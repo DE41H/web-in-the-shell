@@ -26,7 +26,7 @@ class SSRFTransport(httpx.AsyncHTTPTransport):
         host = request.url.host
         port = request.url.port or (443 if request.url.scheme == "https" else 80)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             results = await loop.run_in_executor(
                 None,

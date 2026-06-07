@@ -14,6 +14,7 @@ from serialization.models import CompactStateModel
 from ai.decision.recovery import RecoveryAgent
 from ai.discovery.planner import Plan
 from ai.provider import LLMClient
+from security.redact import redact as _redact
 
 if TYPE_CHECKING:
     from ai.errors import ErrorInfo
@@ -27,7 +28,7 @@ _EXECUTOR_SYSTEM = (
     "Single ```json block only. No prose, no explanation."
 )
 
-_EXECUTOR_MAX_TOKENS = 192
+_EXECUTOR_MAX_TOKENS = 512
 
 _CONTEXT_BUDGET = 480
 
@@ -75,7 +76,7 @@ class ExecutionAgent:
         # GET/DELETE never send a body — skip the LLM refinement call entirely.
         # Also skip when parameters is empty (or all values are None) — no need to
         # ask the LLM to refine nothing.
-        _params_empty = not parameters or all(v is None for v in parameters.values())
+        _params_empty = not parameters
         if m in ("GET", "DELETE") or _params_empty:
             payload = parameters
         else:
@@ -85,7 +86,8 @@ class ExecutionAgent:
         for attempt in range(1, _MAX_RETRIES + 1):
             try:
                 if m == "GET":
-                    response = await self._dispatch.get(endpoint)
+                    get_kwargs = {"params": payload} if payload else {}
+                    response = await self._dispatch.get(endpoint, **get_kwargs)
                 elif m == "PUT":
                     response = await self._dispatch.put(endpoint, payload)
                 elif m == "PATCH":
@@ -117,6 +119,24 @@ class ExecutionAgent:
                     endpoint=endpoint,
                     status_code=last_status,
                     response_body=body,
+                )
+
+            # 403/404/410 mean the endpoint is wrong or auth is missing —
+            # parameter changes can't fix these, so abort immediately.
+            if response.status_code in (403, 404, 410):
+                from ai.errors import classify
+                error_info = classify(
+                    exc=None,
+                    status_code=last_status,
+                    detail="Endpoint not found — the AI may have misidentified the route.",
+                    source="executor",
+                )
+                return ExecutionResult(
+                    success=False,
+                    endpoint=endpoint,
+                    status_code=last_status,
+                    error="Endpoint not found — needs replanning with correct API discovery.",
+                    error_info=error_info,
                 )
 
             if attempt == _MAX_RETRIES:
@@ -254,7 +274,7 @@ class ExecutionAgent:
         prompt = (
             f"Action: {action}\n"
             f"Endpoint: {endpoint}\n"
-            f"Params: {json.dumps(parameters)}\n"
+            f"Params: {_redact(json.dumps(parameters))}\n"
         )
         if context:
             prompt += f"State: {context}\n"

@@ -22,9 +22,11 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]+?)\s*```")
 
 _RECOVERY_SYSTEM = (
     "Fix a failed HTTP request. "
-    "Output revised parameters as a ```json block, "
-    "or ABORT: <reason> if unrecoverable. "
-    "No prose outside those two formats."
+    "Output ONLY ONE of: "
+    "(1) revised parameters as a ```json block, or "
+    "(2) ABORT: <reason>. "
+    "ABORT on 403 (auth/permission error), 404, or 410. "
+    "No prose, no explanation outside these two formats."
 )
 
 _RECOVERY_MAX_TOKENS = 512
@@ -92,7 +94,7 @@ class RecoveryAgent:
             except json.JSONDecodeError:
                 pass
 
-        # 3) Bare JSON object on a single blob.
+        # 3) Bare JSON object.
         if _BARE_JSON_OBJ_RE.match(text):
             try:
                 revised = json.loads(text)
